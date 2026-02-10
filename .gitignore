@@ -1,22 +1,9 @@
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.egg-info/
-dist/
-build/
-.eggs/
-
-# Virtual environments
-.venv/
-.venve/
-
 # Rust
 **/target/
 
 # Node / TypeScript
 node_modules/
-packages/*/dist/
+dist/
 
 # Project-specific
 .lab/
