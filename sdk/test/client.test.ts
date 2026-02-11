@@ -45,6 +45,10 @@ const payloads = {
   'run':             { ok: true, command: 'run', summary, run: { run_id: 'run_20260210_120000', run_dir: '.lab/runs/run_20260210_120000' } },
   'run-dev':         { ok: true, command: 'run-dev', summary, run: { run_id: 'run_dev_001', run_dir: '.lab/runs/run_dev_001' } },
   'run-experiment':  { ok: true, command: 'run-experiment', summary, run: { run_id: 'run_exp_001', run_dir: '.lab/runs/run_exp_001' } },
+  'replay':          { ok: true, command: 'replay', replay: { replay_id: 'replay_001', replay_dir: '.lab/runs/run1/replays/replay_001', parent_trial_id: 'trial_001', strict: false, replay_grade: 'best_effort', harness_status: 'ok' } },
+  'fork':            { ok: true, command: 'fork', fork: { fork_id: 'fork_001', fork_dir: '.lab/runs/run1/forks/fork_001', parent_trial_id: 'trial_001', selector: 'checkpoint:cp1', strict: false, source_checkpoint: 'cp1', fallback_mode: 'none', replay_grade: 'checkpointed', harness_status: 'ok' } },
+  'pause':           { ok: true, command: 'pause', pause: { run_id: 'run1', trial_id: 'trial_001', label: 'pause_001', checkpoint_acked: true, stop_acked: true } },
+  'resume':          { ok: true, command: 'resume', resume: { trial_id: 'trial_001', selector: 'checkpoint:cp1', fork: { fork_id: 'fork_002', fork_dir: '.lab/runs/run1/forks/fork_002', parent_trial_id: 'trial_001', selector: 'checkpoint:cp1', strict: false, source_checkpoint: 'cp1', fallback_mode: 'none', replay_grade: 'checkpointed', harness_status: 'ok' } } },
   'publish':         { ok: true, command: 'publish', bundle: '/tmp/bundle.zip', run_dir: '.lab/runs/run1' },
   'knobs-validate':  { ok: true, command: 'knobs-validate', valid: true },
   'hooks-validate':  { ok: true, command: 'hooks-validate', valid: true },
@@ -377,6 +381,220 @@ describe('LabClient.runExperiment()', () => {
     const { readFileSync } = await import('node:fs');
     const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
     assert.ok(!args.includes('--overrides'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LabClient – replay()
+// ---------------------------------------------------------------------------
+describe('LabClient.replay()', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'sdk-test-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('parses replay success payload', async () => {
+    const bin = makeSuccessRunner(dir);
+    const client = new LabClient({ runnerBin: bin, cwd: dir });
+    const res = await client.replay({ runDir: '.lab/runs/run1', trialId: 'trial_001' });
+    assert.equal(res.ok, true);
+    assert.equal(res.command, 'replay');
+    assert.equal(res.replay.replay_id, 'replay_001');
+    assert.equal(res.replay.parent_trial_id, 'trial_001');
+  });
+
+  test('passes required replay args and --strict', async () => {
+    const { binPath, argsFile } = makeArgCapturingRunner(dir);
+    const client = new LabClient({ runnerBin: binPath, cwd: dir });
+    await client.replay({ runDir: '.lab/runs/run1', trialId: 'trial_001', strict: true });
+
+    const { readFileSync } = await import('node:fs');
+    const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
+    assert.deepEqual(args.slice(0, 7), [
+      'replay',
+      '--run-dir',
+      '.lab/runs/run1',
+      '--trial-id',
+      'trial_001',
+      '--json',
+      '--strict',
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LabClient – fork()
+// ---------------------------------------------------------------------------
+describe('LabClient.fork()', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'sdk-test-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('parses fork success payload', async () => {
+    const bin = makeSuccessRunner(dir);
+    const client = new LabClient({ runnerBin: bin, cwd: dir });
+    const res = await client.fork({
+      runDir: '.lab/runs/run1',
+      fromTrial: 'trial_001',
+      at: 'checkpoint:cp1',
+    });
+    assert.equal(res.ok, true);
+    assert.equal(res.command, 'fork');
+    assert.equal(res.fork.fork_id, 'fork_001');
+    assert.equal(res.fork.selector, 'checkpoint:cp1');
+  });
+
+  test('passes selector, --set bindings, and --strict', async () => {
+    const { binPath, argsFile } = makeArgCapturingRunner(dir);
+    const client = new LabClient({ runnerBin: binPath, cwd: dir });
+    await client.fork({
+      runDir: '.lab/runs/run1',
+      fromTrial: 'trial_001',
+      at: 'checkpoint:cp1',
+      set: {
+        temperature: 0.2,
+        model: 'gpt-4.1',
+        allow_tools: true,
+        metadata: { lane: 'canary' },
+      },
+      strict: true,
+    });
+
+    const { readFileSync } = await import('node:fs');
+    const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
+    assert.ok(args.includes('fork'));
+    assert.ok(args.includes('--from-trial'));
+    assert.ok(args.includes('trial_001'));
+    assert.ok(args.includes('--at'));
+    assert.ok(args.includes('checkpoint:cp1'));
+    assert.ok(args.includes('--strict'));
+    assert.ok(args.includes('--set'));
+    assert.ok(args.includes('temperature=0.2'));
+    assert.ok(args.includes('model="gpt-4.1"'));
+    assert.ok(args.includes('allow_tools=true'));
+    assert.ok(args.includes('metadata={"lane":"canary"}'));
+  });
+
+  test('rejects undefined set binding values', async () => {
+    const { binPath } = makeArgCapturingRunner(dir);
+    const client = new LabClient({ runnerBin: binPath, cwd: dir });
+    await assert.rejects(
+      () =>
+        client.fork({
+          runDir: '.lab/runs/run1',
+          fromTrial: 'trial_001',
+          at: 'checkpoint:cp1',
+          set: { a: undefined },
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof Error);
+        assert.equal(err.message, 'set binding "a" cannot be undefined');
+        return true;
+      },
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LabClient – pause()
+// ---------------------------------------------------------------------------
+describe('LabClient.pause()', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'sdk-test-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('parses pause success payload', async () => {
+    const bin = makeSuccessRunner(dir);
+    const client = new LabClient({ runnerBin: bin, cwd: dir });
+    const res = await client.pause({ runDir: '.lab/runs/run1' });
+    assert.equal(res.ok, true);
+    assert.equal(res.command, 'pause');
+    assert.equal(res.pause.trial_id, 'trial_001');
+    assert.equal(res.pause.checkpoint_acked, true);
+    assert.equal(res.pause.stop_acked, true);
+  });
+
+  test('passes optional pause fields when provided', async () => {
+    const { binPath, argsFile } = makeArgCapturingRunner(dir);
+    const client = new LabClient({ runnerBin: binPath, cwd: dir });
+    await client.pause({
+      runDir: '.lab/runs/run1',
+      trialId: 'trial_001',
+      label: 'safe_boundary',
+      timeoutSeconds: 120,
+    });
+
+    const { readFileSync } = await import('node:fs');
+    const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
+    assert.ok(args.includes('pause'));
+    assert.ok(args.includes('--trial-id'));
+    assert.ok(args.includes('trial_001'));
+    assert.ok(args.includes('--label'));
+    assert.ok(args.includes('safe_boundary'));
+    assert.ok(args.includes('--timeout-seconds'));
+    assert.ok(args.includes('120'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LabClient – resume()
+// ---------------------------------------------------------------------------
+describe('LabClient.resume()', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'sdk-test-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('parses resume success payload', async () => {
+    const bin = makeSuccessRunner(dir);
+    const client = new LabClient({ runnerBin: bin, cwd: dir });
+    const res = await client.resume({ runDir: '.lab/runs/run1' });
+    assert.equal(res.ok, true);
+    assert.equal(res.command, 'resume');
+    assert.equal(res.resume.trial_id, 'trial_001');
+    assert.equal(res.resume.fork.fork_id, 'fork_002');
+  });
+
+  test('passes optional resume fields, --set, and --strict', async () => {
+    const { binPath, argsFile } = makeArgCapturingRunner(dir);
+    const client = new LabClient({ runnerBin: binPath, cwd: dir });
+    await client.resume({
+      runDir: '.lab/runs/run1',
+      trialId: 'trial_001',
+      label: 'cp1',
+      set: { model: 'gpt-4.1-mini', max_steps: 50 },
+      strict: true,
+    });
+
+    const { readFileSync } = await import('node:fs');
+    const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
+    assert.ok(args.includes('resume'));
+    assert.ok(args.includes('--trial-id'));
+    assert.ok(args.includes('trial_001'));
+    assert.ok(args.includes('--label'));
+    assert.ok(args.includes('cp1'));
+    assert.ok(args.includes('--strict'));
+    assert.ok(args.includes('--set'));
+    assert.ok(args.includes('model="gpt-4.1-mini"'));
+    assert.ok(args.includes('max_steps=50'));
   });
 });
 

@@ -2339,7 +2339,9 @@ fn run_harness_container(
     }
 
     let mut cmd = Command::new("docker");
-    cmd.arg("run").arg("--rm");
+    // Keep stdin attached so run_process_with_trial_io can pipe trial_input.json
+    // into the containerized harness process.
+    cmd.arg("run").arg("-i").arg("--rm");
 
     if json_value
         .pointer("/runtime/sandbox/root_read_only")

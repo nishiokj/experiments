@@ -5,13 +5,22 @@ import type {
   CommandOptions,
   DescribeArgs,
   DescribeResponse,
+  ForkArgs,
+  ForkResponse,
   HooksValidateArgs,
+  JsonMap,
   JsonCommandResponse,
   KnobsValidateArgs,
   LabClientOptions,
   LabErrorEnvelope,
+  PauseArgs,
+  PauseResponse,
   PublishArgs,
   PublishResponse,
+  ReplayArgs,
+  ReplayResponse,
+  ResumeArgs,
+  ResumeResponse,
   RunArgs,
   RunDevArgs,
   RunExperimentArgs,
@@ -92,6 +101,61 @@ export class LabClient {
       cmd.push('--overrides', args.overrides);
     }
     return this.runJson<RunResponse>(cmd, args);
+  }
+
+  async replay(args: ReplayArgs): Promise<ReplayResponse> {
+    const cmd = ['replay', '--run-dir', args.runDir, '--trial-id', args.trialId, '--json'];
+    if (args.strict) {
+      cmd.push('--strict');
+    }
+    return this.runJson<ReplayResponse>(cmd, args);
+  }
+
+  async fork(args: ForkArgs): Promise<ForkResponse> {
+    const cmd = [
+      'fork',
+      '--run-dir',
+      args.runDir,
+      '--from-trial',
+      args.fromTrial,
+      '--at',
+      args.at,
+      '--json',
+    ];
+    appendSetBindings(cmd, args.set);
+    if (args.strict) {
+      cmd.push('--strict');
+    }
+    return this.runJson<ForkResponse>(cmd, args);
+  }
+
+  async pause(args: PauseArgs): Promise<PauseResponse> {
+    const cmd = ['pause', '--run-dir', args.runDir, '--json'];
+    if (args.trialId) {
+      cmd.push('--trial-id', args.trialId);
+    }
+    if (args.label) {
+      cmd.push('--label', args.label);
+    }
+    if (typeof args.timeoutSeconds === 'number') {
+      cmd.push('--timeout-seconds', String(args.timeoutSeconds));
+    }
+    return this.runJson<PauseResponse>(cmd, args);
+  }
+
+  async resume(args: ResumeArgs): Promise<ResumeResponse> {
+    const cmd = ['resume', '--run-dir', args.runDir, '--json'];
+    if (args.trialId) {
+      cmd.push('--trial-id', args.trialId);
+    }
+    if (args.label) {
+      cmd.push('--label', args.label);
+    }
+    appendSetBindings(cmd, args.set);
+    if (args.strict) {
+      cmd.push('--strict');
+    }
+    return this.runJson<ResumeResponse>(cmd, args);
   }
 
   async publish(args: PublishArgs): Promise<PublishResponse> {
@@ -256,5 +320,22 @@ export class LabClient {
     }
 
     return parsed;
+  }
+}
+
+function appendSetBindings(args: string[], bindings?: JsonMap): void {
+  if (!bindings) {
+    return;
+  }
+
+  for (const [key, value] of Object.entries(bindings)) {
+    if (!key.trim()) {
+      throw new Error('set bindings must use non-empty keys');
+    }
+    const encoded = JSON.stringify(value);
+    if (encoded === undefined) {
+      throw new Error(`set binding "${key}" cannot be undefined`);
+    }
+    args.push('--set', `${key}=${encoded}`);
   }
 }

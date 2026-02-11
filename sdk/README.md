@@ -109,12 +109,59 @@ const client = new LabClient({
 | `client.run(args)` | `RunResponse` | Run experiment (optional `container` flag) |
 | `client.runDev(args)` | `RunResponse` | Development run with optional `setup` command |
 | `client.runExperiment(args)` | `RunResponse` | Strict run with network isolation |
+| `client.replay(args)` | `ReplayResponse` | Replay a prior trial from run artifacts |
+| `client.fork(args)` | `ForkResponse` | Fork a trial at selector (`checkpoint`, `step`, `event_seq`) |
+| `client.pause(args)` | `PauseResponse` | Cooperative pause via checkpoint+stop handshake |
+| `client.resume(args)` | `ResumeResponse` | Resume paused trial via checkpoint-based continuation |
 | `client.publish(args)` | `PublishResponse` | Create debug bundle from a run |
 | `client.validateKnobs(args)` | `ValidateResponse` | Validate parameter overrides against manifest |
 | `client.validateHooks(args)` | `ValidateResponse` | Validate event stream against harness manifest |
 | `client.validateSchema(args)` | `ValidateResponse` | Validate JSON file against a schema |
 
 All commands accept per-call `cwd` and `env` overrides.
+
+### Control lifecycle example
+
+```ts
+import { LabClient } from '@agentlab/sdk';
+
+const client = new LabClient();
+const runDir = '.lab/runs/run_20260211_120000';
+
+// 1) Pause a trial at the next safe boundary (checkpoint + stop handshake)
+const paused = await client.pause({
+  runDir,
+  trialId: 'trial_001',
+  label: 'before_tool_call',
+  timeoutSeconds: 90,
+});
+
+// 2) Fork from a checkpoint with binding overrides
+const forked = await client.fork({
+  runDir,
+  fromTrial: paused.pause.trial_id,
+  at: 'checkpoint:before_tool_call',
+  set: { model: 'gpt-4.1-mini', temperature: 0.2 },
+  strict: true,
+});
+
+// 3) Resume the paused trial (implemented as checkpoint-based continuation)
+const resumed = await client.resume({
+  runDir,
+  trialId: paused.pause.trial_id,
+  label: 'before_tool_call',
+  set: { max_steps: 50 },
+});
+
+// 4) Replay a trial for validation / debugging
+const replayed = await client.replay({
+  runDir,
+  trialId: paused.pause.trial_id,
+  strict: true,
+});
+
+console.log(forked.fork.fork_id, resumed.resume.fork.fork_id, replayed.replay.replay_id);
+```
 
 ### Error Handling
 
@@ -157,6 +204,14 @@ export type {
   RunDevArgs,
   RunExperimentArgs,
   RunResponse,
+  ReplayArgs,
+  ReplayResponse,
+  ForkArgs,
+  ForkResponse,
+  PauseArgs,
+  PauseResponse,
+  ResumeArgs,
+  ResumeResponse,
   PublishArgs,
   PublishResponse,
   KnobsValidateArgs,
