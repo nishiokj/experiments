@@ -24,6 +24,15 @@ export type MetricSource = 'runner' | 'events' | 'output' | 'artifacts';
 export type ArtifactMeasure = 'file_count' | 'diff_bytes' | 'diff_lines' | 'total_bytes';
 export type MetricAggregate = 'sum' | 'count' | 'max' | 'min' | 'mean' | 'last';
 
+// ---------------------------------------------------------------------------
+// Guardrails
+// ---------------------------------------------------------------------------
+
+export interface GuardrailDef {
+  metric_id: string;
+  max?: number;
+}
+
 export interface MetricDef {
   id: string;
   source: MetricSource;
@@ -166,6 +175,32 @@ export class Metric {
     };
   }
 
+  // -- Guardrail factories ---------------------------------------------------
+
+  static maxTokensIn(n: number): GuardrailDef {
+    return { metric_id: 'tokens_in', max: n };
+  }
+
+  static maxTokensOut(n: number): GuardrailDef {
+    return { metric_id: 'tokens_out', max: n };
+  }
+
+  static maxDuration(ms: number): GuardrailDef {
+    return { metric_id: 'duration_ms', max: ms };
+  }
+
+  static maxToolCalls(n: number): GuardrailDef {
+    return { metric_id: 'tool_call_count', max: n };
+  }
+
+  static maxTurns(n: number): GuardrailDef {
+    return { metric_id: 'turn_count', max: n };
+  }
+
+  static maxCost(n: number): GuardrailDef {
+    return { metric_id: 'cost_usd', max: n };
+  }
+
   private constructor() {} // no instances
 }
 
@@ -199,6 +234,7 @@ export interface ExperimentSpec {
     max_concurrency: number;
   };
   metrics: MetricDef[];
+  guardrails?: GuardrailDef[];
   artifacts?: {
     /** Glob patterns for files to collect from workspace post-trial */
     collect: string[];
@@ -281,10 +317,10 @@ export class ExperimentBuilder {
         limit: 0,
       },
       design: {
-        sanitization_profile: '',
+        sanitization_profile: 'hermetic_functional_v2',
         comparison: 'paired',
-        replications: 0,
-        random_seed: 0,
+        replications: 1,
+        random_seed: 1,
         shuffle_tasks: true,
         max_concurrency: 1,
       },
@@ -394,6 +430,20 @@ export class ExperimentBuilder {
     return this;
   }
 
+  /** Add a budget guardrail. Use Metric.max*() factories for common limits. */
+  guardrail(def: GuardrailDef): this {
+    if (!this.spec.guardrails) {
+      this.spec.guardrails = [];
+    }
+    const idx = this.spec.guardrails.findIndex((g) => g.metric_id === def.metric_id);
+    if (idx >= 0) {
+      this.spec.guardrails[idx] = { ...def };
+    } else {
+      this.spec.guardrails.push({ ...def });
+    }
+    return this;
+  }
+
   /** Configure artifact collection from the workspace after each trial. */
   artifacts(options: { collect: string[]; diff?: boolean; baseDir?: string }): this {
     this.spec.artifacts = {
@@ -427,9 +477,6 @@ export class ExperimentBuilder {
     if (!this.spec.dataset.suite_id) missing.push('dataset suite_id (call .datasetJsonl() with suiteId)');
     if (!this.spec.dataset.split_id) missing.push('dataset split_id (call .datasetJsonl() with splitId)');
     if (this.spec.dataset.limit <= 0) missing.push('dataset limit (call .datasetJsonl() with limit > 0)');
-    if (!this.spec.design.sanitization_profile) missing.push('sanitization_profile (call .sanitizationProfile())');
-    if (this.spec.design.replications <= 0) missing.push('replications (call .replications() with value > 0)');
-    if (this.spec.design.random_seed === 0) missing.push('random_seed (call .randomSeed())');
     if (this.spec.runtime.harness.command.length === 0) missing.push('harness command (call .harnessCli())');
     if (!this.spec.runtime.harness.integration_level) missing.push('harness integration_level (call .harnessCli() with integrationLevel)');
     if (missing.length > 0) {

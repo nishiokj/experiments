@@ -154,6 +154,50 @@ pub struct RunBehavior {
     pub require_network_none: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutorKind {
+    LocalDocker,
+    LocalProcess,
+    Remote,
+}
+
+impl ExecutorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalDocker => "local_docker",
+            Self::LocalProcess => "local_process",
+            Self::Remote => "remote",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaterializationMode {
+    None,
+    MetadataOnly,
+    OutputsOnly,
+    Full,
+}
+
+impl MaterializationMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::MetadataOnly => "metadata_only",
+            Self::OutputsOnly => "outputs_only",
+            Self::Full => "full",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RunExecutionOptions {
+    pub executor: Option<ExecutorKind>,
+    pub materialize: Option<MaterializationMode>,
+    pub remote_endpoint: Option<String>,
+    pub remote_token_env: Option<String>,
+}
+
 fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
@@ -331,7 +375,13 @@ pub struct ExperimentSummary {
 }
 
 pub fn run_experiment(path: &Path, use_container: bool) -> Result<RunResult> {
-    run_experiment_with_behavior(path, use_container, RunBehavior::default(), None)
+    run_experiment_with_behavior(
+        path,
+        use_container,
+        RunBehavior::default(),
+        None,
+        RunExecutionOptions::default(),
+    )
 }
 
 pub fn run_experiment_dev(path: &Path, setup_command: Option<String>) -> Result<RunResult> {
@@ -343,7 +393,28 @@ pub fn run_experiment_with_overrides(
     use_container: bool,
     overrides_path: Option<&Path>,
 ) -> Result<RunResult> {
-    run_experiment_with_behavior(path, use_container, RunBehavior::default(), overrides_path)
+    run_experiment_with_behavior(
+        path,
+        use_container,
+        RunBehavior::default(),
+        overrides_path,
+        RunExecutionOptions::default(),
+    )
+}
+
+pub fn run_experiment_with_options_and_overrides(
+    path: &Path,
+    use_container: bool,
+    overrides_path: Option<&Path>,
+    options: RunExecutionOptions,
+) -> Result<RunResult> {
+    run_experiment_with_behavior(
+        path,
+        use_container,
+        RunBehavior::default(),
+        overrides_path,
+        options,
+    )
 }
 
 pub fn run_experiment_dev_with_overrides(
@@ -356,7 +427,13 @@ pub fn run_experiment_dev_with_overrides(
         network_mode_override: Some("full".to_string()),
         require_network_none: false,
     };
-    run_experiment_with_behavior(path, true, behavior, overrides_path)
+    run_experiment_with_behavior(
+        path,
+        true,
+        behavior,
+        overrides_path,
+        RunExecutionOptions::default(),
+    )
 }
 
 pub fn run_experiment_strict(path: &Path) -> Result<RunResult> {
@@ -372,7 +449,13 @@ pub fn run_experiment_strict_with_overrides(
         network_mode_override: None,
         require_network_none: true,
     };
-    run_experiment_with_behavior(path, true, behavior, overrides_path)
+    run_experiment_with_behavior(
+        path,
+        true,
+        behavior,
+        overrides_path,
+        RunExecutionOptions::default(),
+    )
 }
 
 pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<ReplayResult> {
@@ -1323,6 +1406,7 @@ fn run_experiment_with_behavior(
     use_container: bool,
     behavior: RunBehavior,
     overrides_path: Option<&Path>,
+    execution: RunExecutionOptions,
 ) -> Result<RunResult> {
     let exp_dir = path
         .parent()
@@ -1357,6 +1441,20 @@ fn run_experiment_with_behavior(
         return Err(anyhow!(
             "run-experiment requires network mode 'none' (current effective mode: {})",
             effective_network_mode
+        ));
+    }
+
+    let materialize_mode = execution.materialize.unwrap_or(MaterializationMode::Full);
+    if matches!(execution.executor, Some(ExecutorKind::Remote)) {
+        let endpoint = execution
+            .remote_endpoint
+            .as_deref()
+            .ok_or_else(|| anyhow!("remote executor requires --remote-endpoint"))?;
+        let token_env = execution.remote_token_env.as_deref().unwrap_or("unset");
+        return Err(anyhow!(
+            "remote executor is not implemented yet (endpoint: {}, token_env: {})",
+            endpoint,
+            token_env
         ));
     }
 
@@ -1401,7 +1499,14 @@ fn run_experiment_with_behavior(
 
     let harness = resolve_harness(&json_value, &project_root)?;
     validate_harness_command(&harness.command_raw, &project_root)?;
-    let container_mode = use_container || harness.force_container;
+    let executor_kind = execution.executor.unwrap_or_else(|| {
+        if use_container || harness.force_container {
+            ExecutorKind::LocalDocker
+        } else {
+            ExecutorKind::LocalProcess
+        }
+    });
+    let container_mode = matches!(executor_kind, ExecutorKind::LocalDocker);
 
     let mut trial_summaries = Vec::new();
     let mut event_counts: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
@@ -1480,7 +1585,7 @@ fn run_experiment_with_behavior(
                     }
                 }
 
-                let status = if container_mode {
+                let status = if matches!(executor_kind, ExecutorKind::LocalDocker) {
                     let command = resolve_command_container(&harness.command_raw, &project_root);
                     run_harness_container(
                         &json_value,
@@ -1632,6 +1737,7 @@ fn run_experiment_with_behavior(
                     trial_guard.complete("failed", Some("trial_output_error"))?;
                 }
                 write_run_control(&run_dir, &run_id, "running", None, None)?;
+                apply_materialization_policy(&trial_dir, materialize_mode)?;
             }
         }
     }
@@ -1648,7 +1754,7 @@ fn run_experiment_with_behavior(
         "schema_version": "grades_v1",
         "integration_level": json_value.pointer("/runtime/harness/integration_level").and_then(|v| v.as_str()).unwrap_or("cli_basic"),
         "replay_grade": "best_effort",
-        "isolation_grade": if use_container {"bounded"} else {"leaky"},
+        "isolation_grade": if container_mode {"bounded"} else {"leaky"},
         "comparability_grade": "unknown",
         "provenance_grade": "recorded",
         "privacy_grade": "unknown"
@@ -2808,6 +2914,42 @@ fn write_state_inventory(
     Ok(())
 }
 
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    if path.is_dir() {
+        fs::remove_dir_all(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn apply_materialization_policy(trial_dir: &Path, mode: MaterializationMode) -> Result<()> {
+    match mode {
+        MaterializationMode::Full => return Ok(()),
+        MaterializationMode::OutputsOnly => {
+            for dir_name in ["workspace", "dataset", "state", "tmp", "artifacts"] {
+                remove_path_if_exists(&trial_dir.join(dir_name))?;
+            }
+        }
+        MaterializationMode::MetadataOnly | MaterializationMode::None => {
+            for dir_name in ["workspace", "dataset", "state", "tmp", "artifacts", "out"] {
+                remove_path_if_exists(&trial_dir.join(dir_name))?;
+            }
+            remove_path_if_exists(&trial_dir.join("trial_input.json"))?;
+            remove_path_if_exists(&trial_dir.join("trial_output.json"))?;
+            remove_path_if_exists(&trial_dir.join("harness_manifest.json"))?;
+            remove_path_if_exists(&trial_dir.join("trace_manifest.json"))?;
+            if matches!(mode, MaterializationMode::None) {
+                remove_path_if_exists(&trial_dir.join("state_inventory.json"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn map_container_path_to_host(path: &str, paths: &TrialPaths) -> PathBuf {
     if let Some(rest) = path.strip_prefix("/state") {
         paths.state.join(rest.trim_start_matches('/'))
@@ -3079,7 +3221,10 @@ mod tests {
         trial_dir
     }
 
-    fn spawn_pause_ack_writer(control_path: PathBuf, events_path: PathBuf) -> thread::JoinHandle<()> {
+    fn spawn_pause_ack_writer(
+        control_path: PathBuf,
+        events_path: PathBuf,
+    ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut seen_versions = std::collections::BTreeSet::new();
@@ -3414,7 +3559,8 @@ mod tests {
         .err()
         .expect("strict fork should fail for non-sdk_full");
         assert!(
-            err.to_string().contains("strict fork requires integration_level sdk_full"),
+            err.to_string()
+                .contains("strict fork requires integration_level sdk_full"),
             "unexpected error: {}",
             err
         );
@@ -3586,7 +3732,8 @@ mod tests {
             Some("cp1"),
         );
         ensure_dir(&trial_dir.join("state").join("cp1")).expect("checkpoint path");
-        write_run_control(&run_dir, "run_1", "running", Some("trial_1"), None).expect("run control");
+        write_run_control(&run_dir, "run_1", "running", Some("trial_1"), None)
+            .expect("run control");
 
         let err = resume_run(&run_dir, None, None, &BTreeMap::new(), false)
             .err()
@@ -3641,7 +3788,8 @@ mod tests {
 
         let mut set_bindings = BTreeMap::new();
         set_bindings.insert("resume.override".to_string(), json!(42));
-        let resumed = resume_run(&run_dir, None, None, &set_bindings, false).expect("resume success");
+        let resumed =
+            resume_run(&run_dir, None, None, &set_bindings, false).expect("resume success");
 
         assert_eq!(resumed.trial_id, "trial_1");
         assert_eq!(resumed.selector, "checkpoint:cp_resume");
@@ -3649,8 +3797,14 @@ mod tests {
         assert_eq!(resumed.fork.fallback_mode, "checkpoint");
         assert!(resumed.fork.source_checkpoint.is_some());
 
-        let fork_input = load_json_file(&resumed.fork.fork_dir.join("trial_1").join("trial_input.json"))
-            .expect("fork trial input");
+        let fork_input = load_json_file(
+            &resumed
+                .fork
+                .fork_dir
+                .join("trial_1")
+                .join("trial_input.json"),
+        )
+        .expect("fork trial input");
         assert_eq!(
             fork_input
                 .pointer("/bindings/resume/override")

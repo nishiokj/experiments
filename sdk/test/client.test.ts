@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { describe, afterEach, beforeEach } from 'node:test';
 
 import { LabClient, LabRunnerError } from '../src/client.js';
+import type { AnalysisSummary, AnalysisComparisons } from '../src/types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -44,7 +45,6 @@ const payloads = {
   'describe':        { ok: true, command: 'describe', summary },
   'run':             { ok: true, command: 'run', summary, run: { run_id: 'run_20260210_120000', run_dir: '.lab/runs/run_20260210_120000' } },
   'run-dev':         { ok: true, command: 'run-dev', summary, run: { run_id: 'run_dev_001', run_dir: '.lab/runs/run_dev_001' } },
-  'run-experiment':  { ok: true, command: 'run-experiment', summary, run: { run_id: 'run_exp_001', run_dir: '.lab/runs/run_exp_001' } },
   'replay':          { ok: true, command: 'replay', replay: { replay_id: 'replay_001', replay_dir: '.lab/runs/run1/replays/replay_001', parent_trial_id: 'trial_001', strict: false, replay_grade: 'best_effort', harness_status: 'ok' } },
   'fork':            { ok: true, command: 'fork', fork: { fork_id: 'fork_001', fork_dir: '.lab/runs/run1/forks/fork_001', parent_trial_id: 'trial_001', selector: 'checkpoint:cp1', strict: false, source_checkpoint: 'cp1', fallback_mode: 'none', replay_grade: 'checkpointed', harness_status: 'ok' } },
   'pause':           { ok: true, command: 'pause', pause: { run_id: 'run1', trial_id: 'trial_001', label: 'pause_001', checkpoint_acked: true, stop_acked: true } },
@@ -252,24 +252,50 @@ describe('LabClient.run()', () => {
     assert.ok(res.run.run_id);
   });
 
-  test('passes --container flag when container=true', async () => {
-    const { binPath, argsFile } = makeArgCapturingRunner(dir);
-    const client = new LabClient({ runnerBin: binPath, cwd: dir });
-    await client.run({ experiment: 'exp.yaml', container: true });
-
-    const { readFileSync } = await import('node:fs');
-    const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
-    assert.ok(args.includes('--container'));
-  });
-
-  test('does not pass --container flag when container is falsy', async () => {
+  test('passes experiment and --json to lab run', async () => {
     const { binPath, argsFile } = makeArgCapturingRunner(dir);
     const client = new LabClient({ runnerBin: binPath, cwd: dir });
     await client.run({ experiment: 'exp.yaml' });
 
     const { readFileSync } = await import('node:fs');
     const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
-    assert.ok(!args.includes('--container'));
+    assert.ok(args.includes('run'));
+    assert.ok(args.includes('exp.yaml'));
+    assert.ok(args.includes('--json'));
+  });
+
+  test('passes --overrides when provided', async () => {
+    const { binPath, argsFile } = makeArgCapturingRunner(dir);
+    const client = new LabClient({ runnerBin: binPath, cwd: dir });
+    await client.run({ experiment: 'exp.yaml', overrides: 'ov.json' });
+
+    const { readFileSync } = await import('node:fs');
+    const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
+    assert.ok(args.includes('--overrides'));
+    assert.ok(args.includes('ov.json'));
+  });
+
+  test('passes executor/materialize/remote flags when provided', async () => {
+    const { binPath, argsFile } = makeArgCapturingRunner(dir);
+    const client = new LabClient({ runnerBin: binPath, cwd: dir });
+    await client.run({
+      experiment: 'exp.yaml',
+      executor: 'remote',
+      materialize: 'metadata_only',
+      remoteEndpoint: 'https://runner.example.com',
+      remoteTokenEnv: 'AGENTLAB_REMOTE_TOKEN',
+    });
+
+    const { readFileSync } = await import('node:fs');
+    const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
+    assert.ok(args.includes('--executor'));
+    assert.ok(args.includes('remote'));
+    assert.ok(args.includes('--materialize'));
+    assert.ok(args.includes('metadata_only'));
+    assert.ok(args.includes('--remote-endpoint'));
+    assert.ok(args.includes('https://runner.example.com'));
+    assert.ok(args.includes('--remote-token-env'));
+    assert.ok(args.includes('AGENTLAB_REMOTE_TOKEN'));
   });
 
   test('throws LabRunnerError on error envelope', async () => {
@@ -334,53 +360,6 @@ describe('LabClient.runDev()', () => {
     const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
     assert.ok(args.includes('--overrides'));
     assert.ok(args.includes('ov.json'));
-  });
-});
-
-// ---------------------------------------------------------------------------
-// LabClient – runExperiment()
-// ---------------------------------------------------------------------------
-describe('LabClient.runExperiment()', () => {
-  let dir: string;
-
-  beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), 'sdk-test-'));
-  });
-  afterEach(() => {
-    rmSync(dir, { recursive: true, force: true });
-  });
-
-  test('passes experiment and --json', async () => {
-    const { binPath, argsFile } = makeArgCapturingRunner(dir);
-    const client = new LabClient({ runnerBin: binPath, cwd: dir });
-    await client.runExperiment({ experiment: 'exp.yaml' });
-
-    const { readFileSync } = await import('node:fs');
-    const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
-    assert.ok(args.includes('run-experiment'));
-    assert.ok(args.includes('exp.yaml'));
-    assert.ok(args.includes('--json'));
-  });
-
-  test('passes --overrides when provided', async () => {
-    const { binPath, argsFile } = makeArgCapturingRunner(dir);
-    const client = new LabClient({ runnerBin: binPath, cwd: dir });
-    await client.runExperiment({ experiment: 'exp.yaml', overrides: 'ov.json' });
-
-    const { readFileSync } = await import('node:fs');
-    const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
-    assert.ok(args.includes('--overrides'));
-    assert.ok(args.includes('ov.json'));
-  });
-
-  test('omits --overrides when not set', async () => {
-    const { binPath, argsFile } = makeArgCapturingRunner(dir);
-    const client = new LabClient({ runnerBin: binPath, cwd: dir });
-    await client.runExperiment({ experiment: 'exp.yaml' });
-
-    const { readFileSync } = await import('node:fs');
-    const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
-    assert.ok(!args.includes('--overrides'));
   });
 });
 
@@ -863,5 +842,117 @@ console.log(JSON.stringify({ ok: true, command: 'describe', summary: { call_var:
       (res.summary as unknown as Record<string, unknown>).call_var,
       'per-call',
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LabClient – readAnalysis()
+// ---------------------------------------------------------------------------
+describe('LabClient.readAnalysis()', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'sdk-test-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function writeAnalysisFixtures(runDir: string) {
+    const analysisDir = join(runDir, 'analysis');
+    mkdirSync(analysisDir, { recursive: true });
+
+    const summary: AnalysisSummary = {
+      schema_version: 'analysis_v1',
+      baseline_id: 'control',
+      variants: {
+        control: {
+          total: 50,
+          success_rate: 0.72,
+          primary_metric_name: 'resolved',
+          primary_metric_mean: 0.72,
+          event_counts: {
+            agent_step_start: 500,
+            agent_step_end: 500,
+            model_call_end: 1500,
+            tool_call_end: 800,
+            control_ack: 50,
+            error: 2,
+          },
+        },
+        treatment: {
+          total: 50,
+          success_rate: 0.80,
+          primary_metric_name: 'resolved',
+          primary_metric_mean: 0.80,
+          event_counts: {
+            agent_step_start: 480,
+            agent_step_end: 480,
+            model_call_end: 1400,
+            tool_call_end: 750,
+            control_ack: 50,
+            error: 1,
+          },
+        },
+      },
+    };
+
+    const comparisons: AnalysisComparisons = {
+      schema_version: 'analysis_v1',
+      comparisons: [
+        {
+          baseline: 'control',
+          variant: 'treatment',
+          baseline_success_rate: 0.72,
+          variant_success_rate: 0.80,
+        },
+      ],
+    };
+
+    writeFileSync(join(analysisDir, 'summary.json'), JSON.stringify(summary));
+    writeFileSync(join(analysisDir, 'comparisons.json'), JSON.stringify(comparisons));
+  }
+
+  test('reads and parses analysis files', async () => {
+    const runDir = join(dir, 'run_001');
+    writeAnalysisFixtures(runDir);
+
+    const client = new LabClient({ cwd: dir });
+    const result = await client.readAnalysis({ runDir: 'run_001' });
+
+    assert.equal(result.summary.schema_version, 'analysis_v1');
+    assert.equal(result.summary.baseline_id, 'control');
+    assert.equal(Object.keys(result.summary.variants).length, 2);
+    assert.equal(result.summary.variants.control.success_rate, 0.72);
+    assert.equal(result.summary.variants.treatment.success_rate, 0.80);
+    assert.equal(result.summary.variants.control.event_counts.model_call_end, 1500);
+
+    assert.equal(result.comparisons.schema_version, 'analysis_v1');
+    assert.equal(result.comparisons.comparisons.length, 1);
+    assert.equal(result.comparisons.comparisons[0].baseline, 'control');
+    assert.equal(result.comparisons.comparisons[0].variant, 'treatment');
+    assert.equal(result.comparisons.comparisons[0].variant_success_rate, 0.80);
+  });
+
+  test('throws when analysis directory does not exist', async () => {
+    const client = new LabClient({ cwd: dir });
+    await assert.rejects(
+      () => client.readAnalysis({ runDir: 'nonexistent_run' }),
+      (err: unknown) => {
+        assert.ok(err instanceof Error);
+        return true;
+      },
+    );
+  });
+
+  test('reads from absolute runDir', async () => {
+    const runDir = join(dir, 'abs_run');
+    writeAnalysisFixtures(runDir);
+
+    const client = new LabClient();
+    const result = await client.readAnalysis({ runDir });
+
+    assert.equal(result.summary.baseline_id, 'control');
+    assert.equal(result.comparisons.comparisons.length, 1);
   });
 });

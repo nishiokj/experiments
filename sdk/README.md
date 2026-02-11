@@ -44,10 +44,6 @@ const builder = ExperimentBuilder.create('prompt_ab', 'Prompt A/B Test')
     { integrationLevel: 'cli_events' }
   )
 
-  .sanitizationProfile('hermetic_functional_v2')
-  .replications(3)
-  .randomSeed(42)
-
   .baseline('control', { model: 'gpt-4o', temperature: 0.0 })
   .addVariant('treatment', { model: 'gpt-4o', temperature: 0.7 })
 
@@ -79,7 +75,7 @@ const client = new LabClient();
 const summary = await client.describe({ experiment: '.lab/experiment.yaml' });
 console.log(`Planned: ${summary.summary.total_trials} trials`);
 
-const run = await client.runExperiment({ experiment: '.lab/experiment.yaml' });
+const run = await client.run({ experiment: '.lab/experiment.yaml' });
 console.log(`Done: ${run.run.run_id}`);
 ```
 
@@ -99,25 +95,26 @@ These must be called before `build()` or `toYaml()`:
 |---|---|
 | `.datasetJsonl(path, opts)` | Dataset source. `opts` requires `suiteId`, `splitId`, `limit`. |
 | `.harnessCli(command, opts)` | Harness command array. `opts` requires `integrationLevel`. |
-| `.sanitizationProfile(value)` | Sanitization profile name (e.g. `'hermetic_functional_v2'`). |
-| `.replications(n)` | How many times each (task, variant) pair runs. |
-| `.randomSeed(n)` | Seed for trial ordering reproducibility. |
 
 ### Optional methods
 
-| Method | What it sets |
-|---|---|
-| `.description(text)` | Experiment description. |
-| `.owner(name)` | Experiment owner. |
-| `.tags(list)` | Tag array. |
-| `.baseline(id, bindings)` | Baseline variant with parameter bindings. Default: `{ variant_id: 'base', bindings: {} }`. |
-| `.addVariant(id, bindings)` | Additional variant. Call multiple times for multiple variants. |
-| `.maxConcurrency(n)` | Parallel trial limit. Default: `1`. |
-| `.metric(def)` | Add a metric definition. See Metrics below. |
-| `.artifacts(opts)` | Configure workspace artifact collection. See Artifacts below. |
-| `.networkMode(mode, hosts?)` | `'none'` (default), `'full'`, or `'allowlist_enforced'` with allowed hosts. |
-| `.sandboxImage(image)` | Docker image name. Sets sandbox mode to `container`. |
-| `.localSandbox()` | Run without container isolation (default). |
+| Method | What it sets | Default |
+|---|---|---|
+| `.sanitizationProfile(value)` | Sanitization profile name. | `'hermetic_functional_v2'` |
+| `.replications(n)` | How many times each (task, variant) pair runs. | `1` |
+| `.randomSeed(n)` | Seed for trial ordering reproducibility. | `1` |
+| `.description(text)` | Experiment description. | |
+| `.owner(name)` | Experiment owner. | |
+| `.tags(list)` | Tag array. | |
+| `.baseline(id, bindings)` | Baseline variant with parameter bindings. | `{ variant_id: 'base', bindings: {} }` |
+| `.addVariant(id, bindings)` | Additional variant. Call multiple times for multiple variants. | |
+| `.maxConcurrency(n)` | Parallel trial limit. | `1` |
+| `.metric(def)` | Add a metric definition. See Metrics below. | |
+| `.guardrail(def)` | Add a budget guardrail. See Guardrails below. | |
+| `.artifacts(opts)` | Configure workspace artifact collection. See Artifacts below. | |
+| `.networkMode(mode, hosts?)` | `'none'`, `'full'`, or `'allowlist_enforced'` with allowed hosts. | `'none'` |
+| `.sandboxImage(image)` | Docker image name. Sets sandbox mode to `container`. | |
+| `.localSandbox()` | Run without container isolation. | `local` |
 
 ### Terminal methods
 
@@ -205,6 +202,43 @@ builder
 
 Collected artifacts and diffs are stored in each trial's directory under the run artifacts.
 
+### Guardrails
+
+Budget guardrails set upper bounds on metrics. When a trial exceeds a guardrail limit, the runner fails it. Guardrails reference metrics by `metric_id` — the metric must also be declared via `.metric()`.
+
+```ts
+builder
+  .metric(Metric.TOKENS_IN)
+  .metric(Metric.TOKENS_OUT)
+  .metric(Metric.DURATION_MS)
+  .metric(Metric.TOOL_CALL_COUNT)
+  .guardrail(Metric.maxTokensIn(50_000))     // fail trial if input tokens exceed 50k
+  .guardrail(Metric.maxTokensOut(10_000))     // fail trial if output tokens exceed 10k
+  .guardrail(Metric.maxDuration(300_000))     // fail trial if wall-clock exceeds 5 minutes
+  .guardrail(Metric.maxToolCalls(100))        // fail trial if tool calls exceed 100
+```
+
+**Predefined guardrail factories:**
+
+| Factory | metric_id | What it limits |
+|---|---|---|
+| `Metric.maxTokensIn(n)` | `tokens_in` | Total input tokens per trial |
+| `Metric.maxTokensOut(n)` | `tokens_out` | Total output tokens per trial |
+| `Metric.maxDuration(ms)` | `duration_ms` | Trial wall-clock time in ms |
+| `Metric.maxToolCalls(n)` | `tool_call_count` | Number of tool invocations |
+| `Metric.maxTurns(n)` | `turn_count` | Number of model turns |
+| `Metric.maxCost(n)` | `cost_usd` | Cost (requires `cost_usd` output metric) |
+
+Custom guardrails work with any metric:
+
+```ts
+builder
+  .metric(Metric.fromOutput('cost_usd', '/metrics/cost_usd'))
+  .guardrail({ metric_id: 'cost_usd', max: 5.0 })
+```
+
+Guardrails are lazy — no `guardrails:` section appears in the YAML unless you add at least one. Calling `.guardrail()` with the same `metric_id` replaces the previous entry.
+
 ## LabClient
 
 Spawns the Rust `lab` binary and parses structured JSON responses.
@@ -230,9 +264,8 @@ Resolves the binary in order:
 | Method | Returns | Description |
 |---|---|---|
 | `describe(args)` | `DescribeResponse` | Dry-run: planned trials and resolved config |
-| `run(args)` | `RunResponse` | Execute trials (optional `container` flag) |
+| `run(args)` | `RunResponse` | Execute trials with configured network and sandbox mode |
 | `runDev(args)` | `RunResponse` | Dev run: full network, optional `setup` command |
-| `runExperiment(args)` | `RunResponse` | Strict run: network mode must be `none` |
 | `replay(args)` | `ReplayResponse` | Re-execute a trial from run artifacts |
 | `fork(args)` | `ForkResponse` | Fork a trial at a checkpoint with binding overrides |
 | `pause(args)` | `PauseResponse` | Cooperative pause via checkpoint+stop handshake |
@@ -241,8 +274,27 @@ Resolves the binary in order:
 | `validateKnobs(args)` | `ValidateResponse` | Validate parameter overrides against manifest |
 | `validateHooks(args)` | `ValidateResponse` | Validate event stream against harness manifest |
 | `validateSchema(args)` | `ValidateResponse` | Validate JSON file against schema |
+| `readAnalysis(args)` | `ReadAnalysisResponse` | Read analysis summary and comparisons from a run directory |
 
 All commands accept per-call `cwd` and `env` overrides.
+
+### Analysis access
+
+After a run completes, `readAnalysis()` reads the analysis files from the run directory. This is pure file I/O — no CLI spawn.
+
+```ts
+const result = await client.readAnalysis({ runDir: '.lab/runs/run_20260211_120000' });
+
+// Per-variant summary
+for (const [id, variant] of Object.entries(result.summary.variants)) {
+  console.log(`${id}: ${variant.success_rate} success, ${variant.event_counts.model_call_end} LLM calls`);
+}
+
+// Pairwise comparisons
+for (const cmp of result.comparisons.comparisons) {
+  console.log(`${cmp.baseline} vs ${cmp.variant}: ${cmp.baseline_success_rate} → ${cmp.variant_success_rate}`);
+}
+```
 
 ### Control lifecycle
 
@@ -304,6 +356,75 @@ try {
 }
 ```
 
+## Trial Output Types
+
+Type declarations mirroring `trial_output_v1.jsonschema`. Use these to type-check what your harness writes.
+
+```ts
+import type { TrialOutput, TrialIds, TrialOutcome } from '@agentlab/sdk';
+
+const output: TrialOutput = {
+  schema_version: 'trial_output_v1',
+  ids: { run_id: 'run_001', trial_id: 'trial_001', variant_id: 'baseline', task_id: 'task_001', repl_idx: 0 },
+  outcome: 'success',
+  answer: 'The fix is ...',
+  metrics: { accuracy: 0.95, cost_usd: 0.12 },
+  objective: [{ name: 'resolved', value: 1.0, direction: 'maximize' }],
+  artifacts: [{ path: '/out/patch.diff', logical_name: 'solution_diff' }],
+  checkpoints: [{ path: '/state/cp1.json', logical_name: 'after_analysis', step: 3 }],
+};
+```
+
+| Type | What it represents |
+|---|---|
+| `TrialOutput` | Top-level trial output object |
+| `TrialIds` | `{ run_id, trial_id, variant_id, task_id, repl_idx }` — shared with event types |
+| `TrialOutcome` | `'success' \| 'failure' \| 'missing' \| 'error'` |
+| `TrialError` | `{ error_type?, message?, stack? }` |
+| `ArtifactDecl` | `{ path, logical_name?, mime_type? }` |
+| `CheckpointDecl` | `{ path, logical_name?, step?, epoch? }` |
+| `ObjectiveDef` | `{ name, value, direction? }` |
+
+## Event Stream Types
+
+Typed discriminated union for the `harness_events.jsonl` event stream (at `cli_events` integration level and above). Enables structural diffing of variant behavior — same task, two variants, compare step-by-step what each agent did.
+
+```ts
+import type { HookEvent, ModelCallEndEvent } from '@agentlab/sdk';
+
+function analyzeEvents(events: HookEvent[]) {
+  for (const e of events) {
+    switch (e.event_type) {
+      case 'agent_step_start':
+        console.log(`Step ${e.step_index} started`);
+        break;
+      case 'model_call_end':
+        console.log(`Model call: ${e.usage?.tokens_in} in, ${e.usage?.tokens_out} out`);
+        break;
+      case 'tool_call_end':
+        console.log(`Tool: ${e.tool.name} — ${e.outcome.status}`);
+        break;
+      case 'error':
+        console.log(`Error: ${e.message}`);
+        break;
+    }
+  }
+}
+```
+
+**6 event types** (discriminated on `event_type`):
+
+| Type | Key fields | Purpose |
+|---|---|---|
+| `AgentStepStartEvent` | `step_index` | Opens an agent step |
+| `AgentStepEndEvent` | `step_index`, `budgets?` | Closes a step with running budget totals |
+| `ModelCallEndEvent` | `call_id`, `outcome`, `model?`, `usage?`, `timing?` | Records an LLM call |
+| `ToolCallEndEvent` | `call_id`, `tool`, `outcome`, `timing?` | Records a tool invocation |
+| `ControlAckEvent` | `step_index`, `control_version`, `action_observed` | Acknowledges control plane signal |
+| `ErrorEvent` | `message`, `error_type?`, `stack?` | General error |
+
+**Shared sub-types:** `CallOutcome`, `StepBudgets`, `ModelIdentity`, `CallTiming`, `RedactionInfo`, `HookEventBase`
+
 ## Exports
 
 ```ts
@@ -311,38 +432,43 @@ try {
 export { LabClient, LabRunnerError } from '@agentlab/sdk';
 export { ExperimentBuilder, Metric } from '@agentlab/sdk';
 
-// Types
+// Experiment builder types
 export type {
-  ExperimentSpec,
-  MetricDef,
-  MetricSource,
-  MetricAggregate,
-  ArtifactMeasure,
-  DatasetJsonlOptions,
-  HarnessCliOptions,
-  LabClientOptions,
-  DescribeArgs,
-  DescribeResponse,
-  ExperimentSummary,
-  RunArgs,
-  RunDevArgs,
-  RunExperimentArgs,
-  RunResponse,
-  ReplayArgs,
-  ReplayResponse,
-  ForkArgs,
-  ForkResponse,
-  PauseArgs,
-  PauseResponse,
-  ResumeArgs,
-  ResumeResponse,
-  PublishArgs,
-  PublishResponse,
-  KnobsValidateArgs,
-  HooksValidateArgs,
-  SchemaValidateArgs,
+  ExperimentSpec, MetricDef, MetricSource, MetricAggregate,
+  ArtifactMeasure, GuardrailDef, Bindings,
+  DatasetJsonlOptions, HarnessCliOptions,
+} from '@agentlab/sdk';
+
+// Client types
+export type {
+  LabClientOptions, LabErrorEnvelope, LabErrorPayload,
+  DescribeArgs, DescribeResponse, ExperimentSummary,
+  RunArgs, RunDevArgs, RunResponse,
+  ReplayArgs, ReplayResponse,
+  ForkArgs, ForkResponse,
+  PauseArgs, PauseResponse,
+  ResumeArgs, ResumeResponse,
+  PublishArgs, PublishResponse,
+  KnobsValidateArgs, HooksValidateArgs, SchemaValidateArgs,
   ValidateResponse,
-  LabErrorEnvelope,
-  LabErrorPayload,
+  ReadAnalysisArgs, ReadAnalysisResponse,
+  AnalysisSummary, AnalysisComparisons, ComparisonEntry,
+  VariantSummary, EventCounts,
+} from '@agentlab/sdk';
+
+// Trial output types
+export type {
+  TrialOutput, TrialIds, TrialOutcome, TrialError,
+  ArtifactDecl, CheckpointDecl, ObjectiveDef,
+} from '@agentlab/sdk';
+
+// Event stream types
+export type {
+  HookEvent, HookEventBase,
+  AgentStepStartEvent, AgentStepEndEvent,
+  ModelCallEndEvent, ToolCallEndEvent,
+  ControlAckEvent, ErrorEvent,
+  CallOutcome, StepBudgets, ModelIdentity,
+  CallTiming, RedactionInfo,
 } from '@agentlab/sdk';
 ```

@@ -1,7 +1,10 @@
 import { spawn } from 'node:child_process';
-import { resolve } from 'node:path';
+import { readFile } from 'node:fs/promises';
+import { resolve, join } from 'node:path';
 
 import type {
+  AnalysisComparisons,
+  AnalysisSummary,
   CommandOptions,
   DescribeArgs,
   DescribeResponse,
@@ -17,13 +20,14 @@ import type {
   PauseResponse,
   PublishArgs,
   PublishResponse,
+  ReadAnalysisArgs,
+  ReadAnalysisResponse,
   ReplayArgs,
   ReplayResponse,
   ResumeArgs,
   ResumeResponse,
   RunArgs,
   RunDevArgs,
-  RunExperimentArgs,
   RunResponse,
   SchemaValidateArgs,
   ValidateResponse,
@@ -75,11 +79,20 @@ export class LabClient {
 
   async run(args: RunArgs): Promise<RunResponse> {
     const cmd = ['run', args.experiment, '--json'];
-    if (args.container) {
-      cmd.push('--container');
-    }
     if (args.overrides) {
       cmd.push('--overrides', args.overrides);
+    }
+    if (args.executor) {
+      cmd.push('--executor', args.executor);
+    }
+    if (args.materialize) {
+      cmd.push('--materialize', args.materialize);
+    }
+    if (args.remoteEndpoint) {
+      cmd.push('--remote-endpoint', args.remoteEndpoint);
+    }
+    if (args.remoteTokenEnv) {
+      cmd.push('--remote-token-env', args.remoteTokenEnv);
     }
     return this.runJson<RunResponse>(cmd, args);
   }
@@ -89,14 +102,6 @@ export class LabClient {
     if (args.setup) {
       cmd.push('--setup', args.setup);
     }
-    if (args.overrides) {
-      cmd.push('--overrides', args.overrides);
-    }
-    return this.runJson<RunResponse>(cmd, args);
-  }
-
-  async runExperiment(args: RunExperimentArgs): Promise<RunResponse> {
-    const cmd = ['run-experiment', args.experiment, '--json'];
     if (args.overrides) {
       cmd.push('--overrides', args.overrides);
     }
@@ -193,6 +198,21 @@ export class LabClient {
   async validateSchema(args: SchemaValidateArgs): Promise<ValidateResponse> {
     const cmd = ['schema-validate', '--schema', args.schema, '--file', args.file, '--json'];
     return this.runJson<ValidateResponse>(cmd, args);
+  }
+
+  async readAnalysis(args: ReadAnalysisArgs): Promise<ReadAnalysisResponse> {
+    const base = args.cwd ? resolve(this.cwd, args.cwd, args.runDir) : resolve(this.cwd, args.runDir);
+    const analysisDir = join(base, 'analysis');
+
+    const [summaryRaw, comparisonsRaw] = await Promise.all([
+      readFile(join(analysisDir, 'summary.json'), 'utf8'),
+      readFile(join(analysisDir, 'comparisons.json'), 'utf8'),
+    ]);
+
+    return {
+      summary: JSON.parse(summaryRaw) as AnalysisSummary,
+      comparisons: JSON.parse(comparisonsRaw) as AnalysisComparisons,
+    };
   }
 
   private async runJson<T extends JsonCommandResponse>(args: string[], options?: CommandOptions): Promise<T> {

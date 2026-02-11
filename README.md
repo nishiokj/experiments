@@ -116,10 +116,8 @@ const builder = ExperimentBuilder.create('prompt_ab', 'Prompt A/B Test')
     { integrationLevel: 'cli_events' }
   )
 
-  // --- experiment design ---
-  .sanitizationProfile('hermetic_functional_v2')
+  // --- experiment design (defaults: profile=hermetic_functional_v2, replications=1, seed=1) ---
   .replications(3)
-  .randomSeed(42)
 
   // --- variants (what you're comparing) ---
   .baseline('control', { model: 'gpt-4o', temperature: 0.0 })
@@ -154,6 +152,12 @@ const builder = ExperimentBuilder.create('prompt_ab', 'Prompt A/B Test')
   .metric(Metric.FILES_MODIFIED)
   .metric(Metric.DIFF_LINES)
 
+  // --- guardrails (budget limits) ---
+  // Runner fails a trial if any guardrail is exceeded.
+  .guardrail(Metric.maxTokensIn(50_000))
+  .guardrail(Metric.maxDuration(300_000))
+  .guardrail(Metric.maxToolCalls(100))
+
   // --- isolation ---
   // 'none': no network (default, strictest)
   // 'full': unrestricted network
@@ -169,7 +173,7 @@ const client = new LabClient();
 const summary = await client.describe({ experiment: '.lab/experiment.yaml' });
 console.log(`Planned: ${summary.summary.total_trials} trials`);
 
-const run = await client.runExperiment({ experiment: '.lab/experiment.yaml' });
+const run = await client.run({ experiment: '.lab/experiment.yaml' });
 console.log(`Done: ${run.run.run_id}`);
 ```
 
@@ -209,9 +213,8 @@ const client = new LabClient({
 | Method | Description |
 |---|---|
 | `client.describe(args)` | Dry-run: shows planned trials without executing |
-| `client.run(args)` | Run with optional container mode |
+| `client.run(args)` | Execute trials with configured network and sandbox mode |
 | `client.runDev(args)` | Dev run: full network access, optional setup command |
-| `client.runExperiment(args)` | Strict run: requires network mode `none` |
 | `client.replay(args)` | Replay a prior trial from run artifacts |
 | `client.fork(args)` | Fork a trial at a checkpoint |
 | `client.pause(args)` | Pause a running trial at next safe boundary |
@@ -220,10 +223,27 @@ const client = new LabClient({
 | `client.validateKnobs(args)` | Validate parameter overrides against manifest |
 | `client.validateHooks(args)` | Validate event stream against harness manifest |
 | `client.validateSchema(args)` | Validate JSON file against schema |
+| `client.readAnalysis(args)` | Read typed analysis summary and comparisons from a run |
 
 All commands throw `LabRunnerError` on failure with `code`, `message`, `details`, `exitCode`, `stderr`, and `command` fields.
 
-See [`sdk/README.md`](sdk/README.md) for full API reference and type exports.
+### Post-run analysis
+
+```ts
+const analysis = await client.readAnalysis({ runDir: run.run.run_dir });
+
+for (const [id, v] of Object.entries(analysis.summary.variants)) {
+  console.log(`${id}: ${v.success_rate} success, ${v.event_counts.model_call_end} LLM calls`);
+}
+
+for (const cmp of analysis.comparisons.comparisons) {
+  console.log(`${cmp.baseline} → ${cmp.variant}: ${cmp.baseline_success_rate} → ${cmp.variant_success_rate}`);
+}
+```
+
+The SDK also exports typed interfaces for trial output (`TrialOutput`, `TrialIds`) and the event stream (`HookEvent` discriminated union with 6 event types). These enable structural diffing of variant behavior at the step level.
+
+See [`sdk/README.md`](sdk/README.md) for full API reference, event stream types, guardrails, and type exports.
 
 ---
 
@@ -259,7 +279,7 @@ $EDITOR .lab/experiment.yaml
 ./lab run .lab/experiment.yaml
 ```
 
-`lab describe` is your pre-flight check. It prints the resolved harness command, whether the harness script exists, the number of planned trials, and the effective network/container mode. **Run it before every experiment.**
+`lab describe` is your pre-flight check. It prints the resolved harness command, whether the harness script exists, the number of planned trials, and the effective network/sandbox mode. **Run it before every experiment.**
 
 ### Commands
 
@@ -267,9 +287,8 @@ $EDITOR .lab/experiment.yaml
 |---|---|
 | `init` | Write skeleton `.lab/experiment.yaml` |
 | `describe <experiment>` | Dry-run: show resolved config and trial plan |
-| `run <experiment>` | Execute trials (pass `--container` for container mode) |
+| `run <experiment>` | Execute trials with configured network and sandbox mode |
 | `run-dev <experiment>` | Execute with full network access + optional `--setup` command |
-| `run-experiment <experiment>` | Strict execution: requires network mode `none` |
 | `replay --run-dir <dir> --trial-id <id>` | Re-execute a trial from artifacts |
 | `fork --run-dir <dir> --from-trial <id> --at <selector>` | Fork at checkpoint with `--set k=v` overrides |
 | `pause --run-dir <dir>` | Cooperative pause at next safe boundary |
@@ -287,7 +306,7 @@ Commands that accept `--json` emit exactly one JSON object to stdout. No human t
 
 ```bash
 ./lab describe .lab/experiment.yaml --json
-./lab run-experiment .lab/experiment.yaml --json
+./lab run .lab/experiment.yaml --json
 ```
 
 Success: `{ "ok": true, "command": "describe", "summary": { ... } }`
@@ -300,19 +319,16 @@ This is what the SDK parses internally. You can also consume it from any languag
 
 ## Run Modes
 
-Three commands run trials. They differ in network posture and intended use:
+Two commands run trials. They differ in network posture and intended use:
 
 | Command | Network | Container | Purpose |
 |---|---|---|---|
-| `run` | As configured | `--container` flag (default: local) | General purpose |
+| `run` | As configured | As configured | General purpose — config is the source of truth |
 | `run-dev` | Forced to `full` | Forced on | Iteration: install deps with `--setup`, full network access |
-| `run-experiment` | Must be `none` | Forced on | Production: strict isolation, reproducible results |
 
-**`run`** respects whatever network and sandbox mode you configured. Use this for local development without Docker.
+**`run`** executes trials with the experiment's configured network and sandbox mode. The experiment config is the source of truth — if you configured `networkMode('none')` and `sandboxImage(...)`, that's what runs. No runtime overrides, no flags.
 
 **`run-dev`** overrides network mode to `full` and forces container mode. The `--setup` flag runs a command before trials (e.g., `--setup "npm ci"` to install dependencies inside the container). Use this when your harness needs to fetch dependencies or call external APIs during development.
-
-**`run-experiment`** requires network mode `none` and forces container mode. If your experiment config has any other network mode, it refuses to run. Use this for final experiment execution where reproducibility matters.
 
 ---
 
@@ -465,3 +481,48 @@ Set `experiment.workload_type` in your config:
 
 - **`agent_harness`** — Standard agent evaluation. Harness runs an agent, reports outcome.
 - **`trainer`** — Training workload. Harness reports `objective` (name, value, direction) and training metrics (`train_loss`, `val_acc`, `wall_time_s`). Optional checkpoint reporting.
+
+---
+
+## Curated SWE-bench Lite Workflow
+
+Reusable scripts are available under `scripts/`:
+
+### 1) Build curated inputs from SWE-bench Lite
+
+```bash
+node scripts/build-curated-swebench-lite.mjs --count 50 --max-per-repo 6
+```
+
+Outputs:
+
+- `data/swebench_lite_curated.jsonl`
+- `data/swebench_lite_curated_ids.txt`
+- `data/swebench_lite_curated.meta.json`
+
+### 2) Generate strict container experiment (SDK)
+
+```bash
+node scripts/run-swebench-lite-experiment.mjs --write-only
+```
+
+Writes:
+
+- `.lab/experiments/swebench_lite_curated.yaml`
+
+The script runs via `client.run()` when `--write-only` is omitted.
+It uses container sandboxing and `network.mode: none` (not dev mode).
+
+### 3) Point to your real harness and run
+
+```bash
+AGENTLAB_HARNESS_CMD_JSON='["python","./harness.py","run"]' \
+AGENTLAB_SANDBOX_IMAGE='python:3.11-slim' \
+node scripts/run-swebench-lite-experiment.mjs --runner-bin ./rust/target/release/lab-cli
+```
+
+Notes:
+
+- Prefer `AGENTLAB_HARNESS_CMD_JSON` for exact argument parsing.
+- Harness command paths resolve from project root.
+- Dataset path in the generated experiment is already relative to `.lab/experiments/`.

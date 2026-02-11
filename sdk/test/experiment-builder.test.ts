@@ -2,15 +2,12 @@ import assert from 'node:assert/strict';
 import test, { describe } from 'node:test';
 
 import { ExperimentBuilder, Metric } from '../src/experiment-builder.js';
-import type { ExperimentSpec, MetricDef } from '../src/experiment-builder.js';
+import type { ExperimentSpec, MetricDef, GuardrailDef } from '../src/experiment-builder.js';
 
 // Helper: create a fully configured builder that passes build() validation
 function validBuilder(): ExperimentBuilder {
   return ExperimentBuilder.create('exp-1', 'My Experiment')
     .datasetJsonl('tasks.jsonl', { suiteId: 'suite', splitId: 'dev', limit: 50 })
-    .sanitizationProfile('hermetic_functional_v2')
-    .replications(1)
-    .randomSeed(1337)
     .harnessCli(['node', './harness.js', 'run'], { integrationLevel: 'cli_basic' });
 }
 
@@ -32,6 +29,18 @@ describe('ExperimentBuilder structural defaults', () => {
   test('description and owner are undefined by default', () => {
     assert.equal(spec.experiment.description, undefined);
     assert.equal(spec.experiment.owner, undefined);
+  });
+
+  test('default sanitization_profile is hermetic_functional_v2', () => {
+    assert.equal(spec.design.sanitization_profile, 'hermetic_functional_v2');
+  });
+
+  test('default replications is 1', () => {
+    assert.equal(spec.design.replications, 1);
+  });
+
+  test('default random_seed is 1', () => {
+    assert.equal(spec.design.random_seed, 1);
   });
 
   test('default comparison is paired', () => {
@@ -101,11 +110,12 @@ describe('ExperimentBuilder build() validation', () => {
         assert.ok(err.message.includes('dataset suite_id'));
         assert.ok(err.message.includes('dataset split_id'));
         assert.ok(err.message.includes('dataset limit'));
-        assert.ok(err.message.includes('sanitization_profile'));
-        assert.ok(err.message.includes('replications'));
-        assert.ok(err.message.includes('random_seed'));
         assert.ok(err.message.includes('harness command'));
         assert.ok(err.message.includes('harness integration_level'));
+        // defaults should NOT be listed
+        assert.ok(!err.message.includes('sanitization_profile'));
+        assert.ok(!err.message.includes('replications'));
+        assert.ok(!err.message.includes('random_seed'));
         return true;
       },
     );
@@ -116,9 +126,6 @@ describe('ExperimentBuilder build() validation', () => {
       () =>
         ExperimentBuilder.create('e', 'n')
           .datasetJsonl('tasks.jsonl', { suiteId: 's', splitId: 'dev', limit: 10 })
-          .sanitizationProfile('hermetic_functional_v2')
-          .replications(1)
-          .randomSeed(42)
           .build(),
       (err: Error) => {
         // harness command and integration_level still missing
@@ -126,17 +133,24 @@ describe('ExperimentBuilder build() validation', () => {
         assert.ok(err.message.includes('harness integration_level'));
         // these should NOT be listed
         assert.ok(!err.message.includes('dataset path'));
+        assert.ok(!err.message.includes('sanitization_profile'));
         assert.ok(!err.message.includes('replications'));
+        assert.ok(!err.message.includes('random_seed'));
         return true;
       },
     );
   });
 
-  test('build() succeeds when all required fields are set', () => {
-    const spec = validBuilder().build();
+  test('build() succeeds with only dataset and harness set', () => {
+    const spec = ExperimentBuilder.create('e', 'n')
+      .datasetJsonl('tasks.jsonl', { suiteId: 's', splitId: 'dev', limit: 10 })
+      .harnessCli(['node', './h.js'], { integrationLevel: 'cli_basic' })
+      .build();
     assert.equal(spec.version, '0.3');
     assert.equal(spec.dataset.path, 'tasks.jsonl');
+    assert.equal(spec.design.sanitization_profile, 'hermetic_functional_v2');
     assert.equal(spec.design.replications, 1);
+    assert.equal(spec.design.random_seed, 1);
     assert.equal(spec.runtime.harness.integration_level, 'cli_basic');
   });
 
@@ -778,5 +792,119 @@ describe('ExperimentBuilder complex composition', () => {
 
     assert.equal(spec.runtime.network.mode, 'allowlist_enforced');
     assert.equal(spec.runtime.sandbox.image, 'python:3.11-slim');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Metric guardrail factories
+// ---------------------------------------------------------------------------
+describe('Metric guardrail factories', () => {
+  test('maxTokensIn()', () => {
+    const g = Metric.maxTokensIn(50000);
+    assert.equal(g.metric_id, 'tokens_in');
+    assert.equal(g.max, 50000);
+  });
+
+  test('maxTokensOut()', () => {
+    const g = Metric.maxTokensOut(10000);
+    assert.equal(g.metric_id, 'tokens_out');
+    assert.equal(g.max, 10000);
+  });
+
+  test('maxDuration()', () => {
+    const g = Metric.maxDuration(300000);
+    assert.equal(g.metric_id, 'duration_ms');
+    assert.equal(g.max, 300000);
+  });
+
+  test('maxToolCalls()', () => {
+    const g = Metric.maxToolCalls(100);
+    assert.equal(g.metric_id, 'tool_call_count');
+    assert.equal(g.max, 100);
+  });
+
+  test('maxTurns()', () => {
+    const g = Metric.maxTurns(50);
+    assert.equal(g.metric_id, 'turn_count');
+    assert.equal(g.max, 50);
+  });
+
+  test('maxCost()', () => {
+    const g = Metric.maxCost(5.0);
+    assert.equal(g.metric_id, 'cost_usd');
+    assert.equal(g.max, 5.0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ExperimentBuilder.guardrail()
+// ---------------------------------------------------------------------------
+describe('ExperimentBuilder.guardrail()', () => {
+  test('adds guardrails to spec', () => {
+    const spec = validBuilder()
+      .guardrail(Metric.maxTokensIn(50000))
+      .guardrail(Metric.maxDuration(300000))
+      .build();
+    assert.ok(spec.guardrails);
+    assert.equal(spec.guardrails.length, 2);
+    assert.equal(spec.guardrails[0].metric_id, 'tokens_in');
+    assert.equal(spec.guardrails[0].max, 50000);
+    assert.equal(spec.guardrails[1].metric_id, 'duration_ms');
+    assert.equal(spec.guardrails[1].max, 300000);
+  });
+
+  test('replaces guardrail with same metric_id', () => {
+    const spec = validBuilder()
+      .guardrail(Metric.maxTokensIn(50000))
+      .guardrail(Metric.maxTokensIn(100000))
+      .build();
+    assert.ok(spec.guardrails);
+    assert.equal(spec.guardrails.length, 1);
+    assert.equal(spec.guardrails[0].max, 100000);
+  });
+
+  test('copies the guardrail def (mutation-safe)', () => {
+    const g = Metric.maxToolCalls(100);
+    const spec = validBuilder().guardrail(g).build();
+    (g as { max: number }).max = 999;
+    assert.equal(spec.guardrails![0].max, 100);
+  });
+
+  test('returns this for chaining', () => {
+    const builder = validBuilder();
+    assert.equal(builder.guardrail(Metric.maxTurns(10)), builder);
+  });
+
+  test('spec has no guardrails section by default', () => {
+    const spec = validBuilder().build();
+    assert.equal(spec.guardrails, undefined);
+  });
+
+  test('guardrails survive build() deep copy', () => {
+    const builder = validBuilder().guardrail(Metric.maxCost(5.0));
+    const spec1 = builder.build();
+    const spec2 = builder.build();
+    assert.notEqual(spec1.guardrails, spec2.guardrails);
+    spec1.guardrails![0].max = 999;
+    assert.equal(spec2.guardrails![0].max, 5.0);
+  });
+
+  test('YAML contains guardrails section', () => {
+    const yaml = validBuilder()
+      .guardrail(Metric.maxTokensIn(50000))
+      .guardrail(Metric.maxDuration(300000))
+      .toYaml();
+    assert.ok(yaml.includes('guardrails:'));
+    assert.ok(yaml.includes('tokens_in'));
+    assert.ok(yaml.includes('50000'));
+    assert.ok(yaml.includes('duration_ms'));
+    assert.ok(yaml.includes('300000'));
+  });
+
+  test('custom guardrail with metric_id only', () => {
+    const g: GuardrailDef = { metric_id: 'custom_metric', max: 42 };
+    const spec = validBuilder().guardrail(g).build();
+    assert.equal(spec.guardrails![0].metric_id, 'custom_metric');
+    assert.equal(spec.guardrails![0].max, 42);
   });
 });

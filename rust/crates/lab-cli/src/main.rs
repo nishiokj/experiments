@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -11,12 +11,63 @@ struct Cli {
     command: Commands,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ExecutorArg {
+    #[value(name = "local_docker")]
+    LocalDocker,
+    #[value(name = "local_process")]
+    LocalProcess,
+    #[value(name = "remote")]
+    Remote,
+}
+
+impl From<ExecutorArg> for lab_runner::ExecutorKind {
+    fn from(value: ExecutorArg) -> Self {
+        match value {
+            ExecutorArg::LocalDocker => lab_runner::ExecutorKind::LocalDocker,
+            ExecutorArg::LocalProcess => lab_runner::ExecutorKind::LocalProcess,
+            ExecutorArg::Remote => lab_runner::ExecutorKind::Remote,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum MaterializeArg {
+    #[value(name = "none")]
+    None,
+    #[value(name = "metadata_only")]
+    MetadataOnly,
+    #[value(name = "outputs_only")]
+    OutputsOnly,
+    #[value(name = "full")]
+    Full,
+}
+
+impl From<MaterializeArg> for lab_runner::MaterializationMode {
+    fn from(value: MaterializeArg) -> Self {
+        match value {
+            MaterializeArg::None => lab_runner::MaterializationMode::None,
+            MaterializeArg::MetadataOnly => lab_runner::MaterializationMode::MetadataOnly,
+            MaterializeArg::OutputsOnly => lab_runner::MaterializationMode::OutputsOnly,
+            MaterializeArg::Full => lab_runner::MaterializationMode::Full,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     Run {
         experiment: PathBuf,
         #[arg(long)]
         container: bool,
+        #[arg(long, value_enum)]
+        executor: Option<ExecutorArg>,
+        #[arg(long, value_enum)]
+        materialize: Option<MaterializeArg>,
+        #[arg(long)]
+        remote_endpoint: Option<String>,
+        #[arg(long)]
+        remote_token_env: Option<String>,
         #[arg(long)]
         overrides: Option<PathBuf>,
         #[arg(long)]
@@ -174,15 +225,26 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
         Commands::Run {
             experiment,
             container,
+            executor,
+            materialize,
+            remote_endpoint,
+            remote_token_env,
             overrides,
             json,
         } => {
             let summary =
                 lab_runner::describe_experiment_with_overrides(&experiment, overrides.as_deref())?;
-            let result = lab_runner::run_experiment_with_overrides(
+            let execution = lab_runner::RunExecutionOptions {
+                executor: executor.map(Into::into),
+                materialize: materialize.map(Into::into),
+                remote_endpoint,
+                remote_token_env,
+            };
+            let result = lab_runner::run_experiment_with_options_and_overrides(
                 &experiment,
                 container,
                 overrides.as_deref(),
+                execution.clone(),
             )?;
             if json {
                 return Ok(Some(json!({
@@ -190,7 +252,11 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "command": "run",
                     "summary": summary_to_json(&summary),
                     "run": run_result_to_json(&result),
-                    "container": container
+                    "container": container,
+                    "executor": execution.executor.map(|e| e.as_str()),
+                    "materialize": execution.materialize.map(|m| m.as_str()),
+                    "remote_endpoint": execution.remote_endpoint,
+                    "remote_token_env": execution.remote_token_env
                 })));
             }
             print_summary(&summary);

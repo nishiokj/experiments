@@ -44,13 +44,16 @@ export interface DescribeResponse {
 
 export interface RunResponse {
   ok: true;
-  command: 'run' | 'run-dev' | 'run-experiment';
+  command: 'run' | 'run-dev';
   summary: ExperimentSummary;
   run: RunResult;
   container?: boolean;
+  executor?: 'local_docker' | 'local_process' | 'remote';
+  materialize?: 'none' | 'metadata_only' | 'outputs_only' | 'full';
+  remote_endpoint?: string | null;
+  remote_token_env?: string | null;
   dev_setup?: string | null;
   dev_network_mode?: string;
-  experiment_network_requirement?: string;
 }
 
 export interface PublishResponse {
@@ -153,14 +156,15 @@ export interface DescribeArgs extends CommandOptions {
 }
 
 export interface RunArgs extends DescribeArgs {
-  container?: boolean;
+  executor?: 'local_docker' | 'local_process' | 'remote';
+  materialize?: 'none' | 'metadata_only' | 'outputs_only' | 'full';
+  remoteEndpoint?: string;
+  remoteTokenEnv?: string;
 }
 
 export interface RunDevArgs extends DescribeArgs {
   setup?: string;
 }
-
-export interface RunExperimentArgs extends DescribeArgs {}
 
 export interface ReplayArgs extends CommandOptions {
   runDir: string;
@@ -209,4 +213,52 @@ export interface HooksValidateArgs extends CommandOptions {
 export interface SchemaValidateArgs extends CommandOptions {
   schema: string;
   file: string;
+}
+
+// ---------------------------------------------------------------------------
+// Analysis types
+// ---------------------------------------------------------------------------
+
+export interface EventCounts {
+  agent_step_start: number;
+  agent_step_end: number;
+  model_call_end: number;
+  tool_call_end: number;
+  control_ack: number;
+  error: number;
+}
+
+export interface VariantSummary {
+  total: number;
+  success_rate: number;
+  primary_metric_name?: string;
+  primary_metric_mean?: number;
+  event_counts: EventCounts;
+}
+
+export interface AnalysisSummary {
+  schema_version: string;
+  baseline_id: string;
+  variants: Record<string, VariantSummary>;
+}
+
+export interface ComparisonEntry {
+  baseline: string;
+  variant: string;
+  baseline_success_rate: number;
+  variant_success_rate: number;
+}
+
+export interface AnalysisComparisons {
+  schema_version: string;
+  comparisons: ComparisonEntry[];
+}
+
+export interface ReadAnalysisArgs extends CommandOptions {
+  runDir: string;
+}
+
+export interface ReadAnalysisResponse {
+  summary: AnalysisSummary;
+  comparisons: AnalysisComparisons;
 }

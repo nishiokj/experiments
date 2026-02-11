@@ -1,0 +1,22 @@
+{
+  "dataset": "princeton-nlp/SWE-bench_Lite",
+  "split": "test",
+  "total_source_rows": 300,
+  "selected_rows": 50,
+  "selected_from": "existing_ids",
+  "output": "data/swebench_lite_curated.jsonl",
+  "ids_file": "data/swebench_lite_curated_ids.txt",
+  "generated_at": "2026-02-11T16:15:25.147Z",
+  "repo_distribution": {
+    "astropy/astropy": 6,
+    "django/django": 6,
+    "matplotlib/matplotlib": 6,
+    "mwaskom/seaborn": 4,
+    "pallets/flask": 3,
+    "psf/requests": 6,
+    "pydata/xarray": 5,
+    "pylint-dev/pylint": 6,
+    "pytest-dev/pytest": 6,
+    "scikit-learn/scikit-learn": 2
+  }
+}
