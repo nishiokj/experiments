@@ -1,5 +1,16 @@
 export { LabClient, LabRunnerError } from './client.js';
-export { ExperimentBuilder, Metric } from './experiment-builder.js';
+export { ExperimentBuilder, ExperimentType, Metric } from './experiment-builder.js';
+export {
+  createOutcomeBoundary,
+  createRunnerBoundaryManifest,
+  mapOutcome,
+  compileTaskBoundaries,
+  taskBoundariesToJsonl,
+  assertTaskBoundaryV1,
+  EVENT_OUTPUT_CONTRACT_V1,
+  INVOCATION_ENV_CONTRACT_V1,
+  WORKSPACE_CONTRACT_V1,
+} from './boundary-mappers.js';
 
 export type {
   AnalysisComparisons,
@@ -27,27 +38,56 @@ export type {
   ReplayArgs,
   ReplayResponse,
   ReplayResult,
+  ReadBenchmarkArgs,
+  ReadBenchmarkResponse,
+  ReadEvidenceArgs,
+  ReadEvidenceResponse,
+  RunArtifacts,
   ResumeArgs,
   ResumeResponse,
   ResumeResult,
   RunArgs,
   RunDevArgs,
   RunResponse,
+  RunResult,
   SchemaValidateArgs,
   ValidateResponse,
   VariantSummary,
+  BenchmarkAdapterManifest,
+  BenchmarkEvaluator,
+  BenchmarkPredictionRecord,
+  BenchmarkScoreRecord,
+  BenchmarkSummary,
+  BenchmarkSummaryVariant,
+  EvidencePolicy,
+  EvidenceRecord,
+  EvidenceRefs,
+  EvidenceRuntime,
+  TaskChainStateRecord,
 } from './types.js';
 
 export type {
   ArtifactMeasure,
+  BenchmarkAdapterConfig,
+  BenchmarkConfig,
+  BenchmarkScoringLifecycle,
+  BenchmarkTaskModel,
+  BenchmarkTypePolicy,
   Bindings,
+  ComparisonPolicy,
   DatasetJsonlOptions,
+  DesignPolicies,
   ExperimentSpec,
   GuardrailDef,
   HarnessCliOptions,
   MetricAggregate,
   MetricDef,
   MetricSource,
+  PruningPolicy,
+  RetryPolicy,
+  RetryTrigger,
+  SchedulingPolicy,
+  StatePolicy,
 } from './experiment-builder.js';
 
 export type {
@@ -76,3 +116,22 @@ export type {
   StepBudgets,
   ToolCallEndEvent,
 } from './hook-events.js';
+
+export type {
+  EventOutputContractV1,
+  InputMapper,
+  InputMapperContext,
+  InvocationContractV1,
+  InvocationEnvContractV1,
+  JsonValue,
+  MountReferenceV1,
+  MountSemanticsContractV1,
+  OutcomeBoundaryV1,
+  OutcomeMapper,
+  OutcomeResultSummaryV1,
+  RunnerBoundaryManifestV1,
+  TaskBoundaryV1,
+  TaskLimitsV1,
+  WorkspaceContractV1,
+  WorkspaceFileV1,
+} from './boundary-mappers.js';

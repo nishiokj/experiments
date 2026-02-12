@@ -1,8 +1,19 @@
 import assert from 'node:assert/strict';
 import test, { describe } from 'node:test';
 
-import { ExperimentBuilder, Metric } from '../src/experiment-builder.js';
-import type { ExperimentSpec, MetricDef, GuardrailDef } from '../src/experiment-builder.js';
+import { ExperimentBuilder, ExperimentType, Metric } from '../src/experiment-builder.js';
+import type {
+  ComparisonPolicy,
+  DesignPolicies,
+  ExperimentSpec,
+  GuardrailDef,
+  MetricDef,
+  PruningPolicy,
+  RetryPolicy,
+  RetryTrigger,
+  SchedulingPolicy,
+  StatePolicy,
+} from '../src/experiment-builder.js';
 
 // Helper: create a fully configured builder that passes build() validation
 function validBuilder(): ExperimentBuilder {
@@ -906,5 +917,421 @@ describe('ExperimentBuilder.guardrail()', () => {
     const spec = validBuilder().guardrail(g).build();
     assert.equal(spec.guardrails![0].metric_id, 'custom_metric');
     assert.equal(spec.guardrails![0].max, 42);
+  });
+});
+
+// Helper: valid builder using .from() flow (needs id/name set separately)
+function validFromBuilder(policies: DesignPolicies): ExperimentBuilder {
+  return ExperimentBuilder.from(policies)
+    .id('exp-from')
+    .name('From Experiment')
+    .datasetJsonl('tasks.jsonl', { suiteId: 'suite', splitId: 'dev', limit: 50 })
+    .harnessCli(['node', './harness.js', 'run'], { integrationLevel: 'cli_basic' })
+    .baseline('control', { model: 'base' })
+    .addVariant('treatment', { model: 'new' });
+}
+
+// ---------------------------------------------------------------------------
+// ExperimentType presets
+// ---------------------------------------------------------------------------
+describe('ExperimentType presets', () => {
+  test('AB_TEST has paired_interleaved scheduling', () => {
+    assert.equal(ExperimentType.AB_TEST.scheduling, 'paired_interleaved');
+    assert.equal(ExperimentType.AB_TEST.state, 'isolate_per_trial');
+    assert.equal(ExperimentType.AB_TEST.comparison, 'paired');
+    assert.equal(ExperimentType.AB_TEST.retry.max_attempts, 1);
+    assert.equal(ExperimentType.AB_TEST.retry.retry_on, undefined);
+  });
+
+  test('MULTI_VARIANT has paired_interleaved scheduling', () => {
+    assert.equal(ExperimentType.MULTI_VARIANT.scheduling, 'paired_interleaved');
+    assert.equal(ExperimentType.MULTI_VARIANT.comparison, 'paired');
+  });
+
+  test('PARAMETER_SWEEP has variant_sequential scheduling', () => {
+    assert.equal(ExperimentType.PARAMETER_SWEEP.scheduling, 'variant_sequential');
+    assert.equal(ExperimentType.PARAMETER_SWEEP.comparison, 'unpaired');
+  });
+
+  test('REGRESSION has retry with max_attempts 3', () => {
+    assert.equal(ExperimentType.REGRESSION.scheduling, 'variant_sequential');
+    assert.equal(ExperimentType.REGRESSION.comparison, 'none');
+    assert.equal(ExperimentType.REGRESSION.retry.max_attempts, 3);
+    assert.deepEqual(ExperimentType.REGRESSION.retry.retry_on, ['error']);
+  });
+
+  test('all presets satisfy DesignPolicies type', () => {
+    // Compile-time check: all presets are assignable to DesignPolicies
+    const presets: DesignPolicies[] = [
+      ExperimentType.AB_TEST,
+      ExperimentType.MULTI_VARIANT,
+      ExperimentType.PARAMETER_SWEEP,
+      ExperimentType.REGRESSION,
+    ];
+    assert.equal(presets.length, 4);
+  });
+
+  test('all preset scheduling values are valid SchedulingPolicy', () => {
+    const valid: SchedulingPolicy[] = ['paired_interleaved', 'variant_sequential', 'randomized'];
+    for (const preset of Object.values(ExperimentType)) {
+      assert.ok(valid.includes(preset.scheduling), `${preset.scheduling} is valid`);
+    }
+  });
+
+  test('all preset state values are valid StatePolicy', () => {
+    const valid: StatePolicy[] = ['isolate_per_trial', 'persist_per_task', 'accumulate'];
+    for (const preset of Object.values(ExperimentType)) {
+      assert.ok(valid.includes(preset.state), `${preset.state} is valid`);
+    }
+  });
+
+  test('all preset comparison values are valid ComparisonPolicy', () => {
+    const valid: ComparisonPolicy[] = ['paired', 'unpaired', 'none'];
+    for (const preset of Object.values(ExperimentType)) {
+      assert.ok(valid.includes(preset.comparison), `${preset.comparison} is valid`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ExperimentBuilder.from()
+// ---------------------------------------------------------------------------
+describe('ExperimentBuilder.from()', () => {
+  test('from(AB_TEST) produces spec with correct policies', () => {
+    const spec = validFromBuilder(ExperimentType.AB_TEST).build();
+    assert.ok(spec.design.policies);
+    assert.equal(spec.design.policies.scheduling, 'paired_interleaved');
+    assert.equal(spec.design.policies.state, 'isolate_per_trial');
+    assert.equal(spec.design.policies.comparison, 'paired');
+    assert.equal(spec.design.policies.retry.max_attempts, 1);
+  });
+
+  test('from(PARAMETER_SWEEP) produces spec with unpaired comparison', () => {
+    const spec = validFromBuilder(ExperimentType.PARAMETER_SWEEP).build();
+    assert.ok(spec.design.policies);
+    assert.equal(spec.design.policies.scheduling, 'variant_sequential');
+    assert.equal(spec.design.comparison, 'unpaired');
+    assert.equal(spec.design.policies.comparison, 'unpaired');
+  });
+
+  test('from(REGRESSION) includes retry_on in policies', () => {
+    const builder = ExperimentBuilder.from(ExperimentType.REGRESSION)
+      .id('reg-test')
+      .name('Regression Test')
+      .datasetJsonl('tasks.jsonl', { suiteId: 's', splitId: 'dev', limit: 10 })
+      .harnessCli(['node', 'h.js'], { integrationLevel: 'cli_basic' });
+    // REGRESSION has comparison: 'none' — no paired validation triggered
+    const spec = builder.build();
+    assert.ok(spec.design.policies);
+    assert.equal(spec.design.policies.retry.max_attempts, 3);
+    assert.deepEqual(spec.design.policies.retry.retry_on, ['error']);
+    assert.equal(spec.design.comparison, 'none');
+  });
+
+  test('from() syncs design.comparison with policies.comparison', () => {
+    const spec = validFromBuilder(ExperimentType.PARAMETER_SWEEP).build();
+    assert.equal(spec.design.comparison, spec.design.policies!.comparison);
+  });
+
+  test('from() without .id() or .name() fails build validation', () => {
+    assert.throws(
+      () =>
+        ExperimentBuilder.from(ExperimentType.AB_TEST)
+          .datasetJsonl('tasks.jsonl', { suiteId: 's', splitId: 'dev', limit: 10 })
+          .harnessCli(['node', 'h.js'], { integrationLevel: 'cli_basic' })
+          .addVariant('v', {})
+          .build(),
+      (err: Error) => {
+        assert.ok(err.message.includes('experiment id'));
+        assert.ok(err.message.includes('experiment name'));
+        return true;
+      },
+    );
+  });
+
+  test('from() with custom policies', () => {
+    const custom: DesignPolicies = {
+      scheduling: 'randomized',
+      state: 'persist_per_task',
+      comparison: 'paired',
+      retry: { max_attempts: 2, retry_on: ['error', 'timeout'] },
+      pruning: { max_consecutive_failures: 5 },
+    };
+    const spec = validFromBuilder(custom).build();
+    assert.ok(spec.design.policies);
+    assert.equal(spec.design.policies.scheduling, 'randomized');
+    assert.equal(spec.design.policies.state, 'persist_per_task');
+    assert.equal(spec.design.policies.retry.max_attempts, 2);
+    assert.deepEqual(spec.design.policies.retry.retry_on, ['error', 'timeout']);
+    assert.equal(spec.design.policies.pruning?.max_consecutive_failures, 5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ExperimentBuilder.policies() setter
+// ---------------------------------------------------------------------------
+describe('ExperimentBuilder.policies() setter', () => {
+  test('policies() sets design.policies on existing builder', () => {
+    const spec = validBuilder()
+      .addVariant('v1', {})
+      .policies(ExperimentType.AB_TEST)
+      .build();
+    assert.ok(spec.design.policies);
+    assert.equal(spec.design.policies.scheduling, 'paired_interleaved');
+  });
+
+  test('policies() syncs design.comparison', () => {
+    const spec = validBuilder()
+      .policies(ExperimentType.PARAMETER_SWEEP)
+      .build();
+    assert.equal(spec.design.comparison, 'unpaired');
+  });
+
+  test('policies() returns this for chaining', () => {
+    const builder = validBuilder();
+    assert.equal(builder.policies(ExperimentType.PARAMETER_SWEEP), builder);
+  });
+
+  test('policies() overrides previous from()', () => {
+    const spec = ExperimentBuilder.from(ExperimentType.AB_TEST)
+      .id('test')
+      .name('test')
+      .datasetJsonl('t.jsonl', { suiteId: 's', splitId: 'd', limit: 1 })
+      .harnessCli(['n', 'h'], { integrationLevel: 'cli_basic' })
+      .addVariant('v', {})
+      .policies(ExperimentType.PARAMETER_SWEEP)
+      .build();
+    assert.equal(spec.design.policies!.scheduling, 'variant_sequential');
+    assert.equal(spec.design.comparison, 'unpaired');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Policy coherence validation
+// ---------------------------------------------------------------------------
+describe('Policy coherence validation', () => {
+  test('paired comparison with no treatments throws', () => {
+    assert.throws(
+      () =>
+        ExperimentBuilder.from(ExperimentType.AB_TEST)
+          .id('test')
+          .name('test')
+          .datasetJsonl('t.jsonl', { suiteId: 's', splitId: 'd', limit: 1 })
+          .harnessCli(['n', 'h'], { integrationLevel: 'cli_basic' })
+          // No .addVariant() — only baseline
+          .build(),
+      (err: Error) => {
+        assert.ok(err.message.includes('policy coherence'));
+        assert.ok(err.message.includes('paired comparison requires'));
+        return true;
+      },
+    );
+  });
+
+  test('paired_interleaved with single variant throws', () => {
+    assert.throws(
+      () =>
+        ExperimentBuilder.from({
+          scheduling: 'paired_interleaved',
+          state: 'isolate_per_trial',
+          comparison: 'none', // comparison is 'none' but scheduling is paired_interleaved
+          retry: { max_attempts: 1 },
+        })
+          .id('test')
+          .name('test')
+          .datasetJsonl('t.jsonl', { suiteId: 's', splitId: 'd', limit: 1 })
+          .harnessCli(['n', 'h'], { integrationLevel: 'cli_basic' })
+          .build(),
+      (err: Error) => {
+        assert.ok(err.message.includes('paired_interleaved scheduling requires'));
+        return true;
+      },
+    );
+  });
+
+  test('retry max_attempts < 1 throws', () => {
+    assert.throws(
+      () =>
+        ExperimentBuilder.from({
+          scheduling: 'variant_sequential',
+          state: 'isolate_per_trial',
+          comparison: 'none',
+          retry: { max_attempts: 0 },
+        })
+          .id('test')
+          .name('test')
+          .datasetJsonl('t.jsonl', { suiteId: 's', splitId: 'd', limit: 1 })
+          .harnessCli(['n', 'h'], { integrationLevel: 'cli_basic' })
+          .build(),
+      (err: Error) => {
+        assert.ok(err.message.includes('retry.max_attempts must be >= 1'));
+        return true;
+      },
+    );
+  });
+
+  test('reports multiple coherence errors at once', () => {
+    assert.throws(
+      () =>
+        ExperimentBuilder.from({
+          scheduling: 'paired_interleaved',
+          state: 'isolate_per_trial',
+          comparison: 'paired',
+          retry: { max_attempts: 0 },
+        })
+          .id('test')
+          .name('test')
+          .datasetJsonl('t.jsonl', { suiteId: 's', splitId: 'd', limit: 1 })
+          .harnessCli(['n', 'h'], { integrationLevel: 'cli_basic' })
+          .build(),
+      (err: Error) => {
+        assert.ok(err.message.includes('paired comparison requires'));
+        assert.ok(err.message.includes('paired_interleaved scheduling requires'));
+        assert.ok(err.message.includes('retry.max_attempts'));
+        return true;
+      },
+    );
+  });
+
+  test('no coherence error without policies', () => {
+    // ExperimentBuilder.create() doesn't set policies — should not trigger coherence validation
+    const spec = validBuilder().build();
+    assert.equal(spec.design.policies, undefined);
+  });
+
+  test('valid paired with treatments passes', () => {
+    const spec = validFromBuilder(ExperimentType.AB_TEST).build();
+    assert.ok(spec.design.policies);
+    assert.equal(spec.design.policies.comparison, 'paired');
+    assert.equal(spec.variant_plan.length, 1); // one treatment
+  });
+
+  test('none comparison with no treatments passes', () => {
+    const spec = ExperimentBuilder.from(ExperimentType.REGRESSION)
+      .id('test')
+      .name('test')
+      .datasetJsonl('t.jsonl', { suiteId: 's', splitId: 'd', limit: 1 })
+      .harnessCli(['n', 'h'], { integrationLevel: 'cli_basic' })
+      .build();
+    assert.equal(spec.design.policies!.comparison, 'none');
+    assert.equal(spec.variant_plan.length, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Policy deep copy correctness
+// ---------------------------------------------------------------------------
+describe('Policy deep copy correctness', () => {
+  test('from() does not alias retry_on array', () => {
+    const retry_on: RetryTrigger[] = ['error', 'timeout'];
+    const policies: DesignPolicies = {
+      scheduling: 'variant_sequential',
+      state: 'isolate_per_trial',
+      comparison: 'none',
+      retry: { max_attempts: 2, retry_on },
+    };
+    const spec = ExperimentBuilder.from(policies)
+      .id('t').name('t')
+      .datasetJsonl('t.jsonl', { suiteId: 's', splitId: 'd', limit: 1 })
+      .harnessCli(['n', 'h'], { integrationLevel: 'cli_basic' })
+      .build();
+
+    // Mutate the original
+    retry_on.push('failure');
+    assert.deepEqual(spec.design.policies!.retry.retry_on, ['error', 'timeout']);
+  });
+
+  test('from() does not alias pruning object', () => {
+    const pruning: PruningPolicy = { max_consecutive_failures: 5 };
+    const policies: DesignPolicies = {
+      scheduling: 'variant_sequential',
+      state: 'isolate_per_trial',
+      comparison: 'none',
+      retry: { max_attempts: 1 },
+      pruning,
+    };
+    const spec = ExperimentBuilder.from(policies)
+      .id('t').name('t')
+      .datasetJsonl('t.jsonl', { suiteId: 's', splitId: 'd', limit: 1 })
+      .harnessCli(['n', 'h'], { integrationLevel: 'cli_basic' })
+      .build();
+
+    pruning.max_consecutive_failures = 99;
+    assert.equal(spec.design.policies!.pruning!.max_consecutive_failures, 5);
+  });
+
+  test('policies() setter does not alias retry_on array', () => {
+    const retry_on: RetryTrigger[] = ['error'];
+    const spec = validBuilder()
+      .policies({
+        scheduling: 'variant_sequential',
+        state: 'isolate_per_trial',
+        comparison: 'none',
+        retry: { max_attempts: 2, retry_on },
+      })
+      .build();
+
+    retry_on.push('failure');
+    assert.deepEqual(spec.design.policies!.retry.retry_on, ['error']);
+  });
+
+  test('policies survive build() deep copy', () => {
+    const builder = validFromBuilder(ExperimentType.AB_TEST);
+    const spec1 = builder.build();
+    const spec2 = builder.build();
+    assert.notEqual(spec1.design.policies, spec2.design.policies);
+    assert.notEqual(spec1.design.policies!.retry, spec2.design.policies!.retry);
+  });
+
+  test('undefined retry_on stays undefined after copy', () => {
+    const spec = validFromBuilder(ExperimentType.AB_TEST).build();
+    assert.equal(spec.design.policies!.retry.retry_on, undefined);
+  });
+
+  test('undefined pruning stays undefined after copy', () => {
+    const spec = validFromBuilder(ExperimentType.AB_TEST).build();
+    assert.equal(spec.design.policies!.pruning, undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// .id() and .name() setters
+// ---------------------------------------------------------------------------
+describe('ExperimentBuilder .id() and .name()', () => {
+  test('id() sets experiment.id', () => {
+    const spec = ExperimentBuilder.from(ExperimentType.PARAMETER_SWEEP)
+      .id('my-id')
+      .name('my-name')
+      .datasetJsonl('t.jsonl', { suiteId: 's', splitId: 'd', limit: 1 })
+      .harnessCli(['n', 'h'], { integrationLevel: 'cli_basic' })
+      .build();
+    assert.equal(spec.experiment.id, 'my-id');
+    assert.equal(spec.experiment.name, 'my-name');
+  });
+
+  test('id() and name() return this for chaining', () => {
+    const builder = ExperimentBuilder.from(ExperimentType.AB_TEST);
+    assert.equal(builder.id('x'), builder);
+    assert.equal(builder.name('y'), builder);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// YAML output with policies
+// ---------------------------------------------------------------------------
+describe('ExperimentBuilder toYaml() with policies', () => {
+  test('YAML contains policies section', () => {
+    const yaml = validFromBuilder(ExperimentType.AB_TEST).toYaml();
+    assert.ok(yaml.includes('policies:'));
+    assert.ok(yaml.includes('paired_interleaved'));
+    assert.ok(yaml.includes('isolate_per_trial'));
+  });
+
+  test('YAML contains retry settings', () => {
+    const yaml = validFromBuilder(ExperimentType.REGRESSION)
+      .addVariant('v2', {})
+      .toYaml();
+    assert.ok(yaml.includes('max_attempts:'));
+    assert.ok(yaml.includes('retry_on:'));
   });
 });

@@ -252,6 +252,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "command": "run",
                     "summary": summary_to_json(&summary),
                     "run": run_result_to_json(&result),
+                    "artifacts": run_artifacts_to_json(&result),
                     "container": container,
                     "executor": execution.executor.map(|e| e.as_str()),
                     "materialize": execution.materialize.map(|m| m.as_str()),
@@ -283,6 +284,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "command": "run-dev",
                     "summary": summary_to_json(&summary),
                     "run": run_result_to_json(&result),
+                    "artifacts": run_artifacts_to_json(&result),
                     "dev_setup": setup_for_json,
                     "dev_network_mode": "full"
                 })));
@@ -673,6 +675,22 @@ fn run_result_to_json(result: &lab_runner::RunResult) -> Value {
     })
 }
 
+fn run_artifacts_to_json(result: &lab_runner::RunResult) -> Value {
+    let evidence = result.run_dir.join("evidence");
+    let benchmark = result.run_dir.join("benchmark");
+    let summary_path = benchmark.join("summary.json");
+    json!({
+        "evidence_records_path": evidence.join("evidence_records.jsonl").display().to_string(),
+        "task_chain_states_path": evidence.join("task_chain_states.jsonl").display().to_string(),
+        "benchmark_dir": benchmark.display().to_string(),
+        "benchmark_summary_path": if summary_path.exists() {
+            Some(summary_path.display().to_string())
+        } else {
+            None::<String>
+        }
+    })
+}
+
 fn replay_result_to_json(result: &lab_runner::ReplayResult) -> Value {
     json!({
         "replay_id": result.replay_id,
@@ -753,7 +771,11 @@ fn summary_to_json(summary: &lab_runner::ExperimentSummary) -> Value {
         "tracing": summary.tracing_mode,
         "control_path": summary.control_path,
         "harness_script_resolved": summary.harness_script_resolved.as_ref().map(|p| p.display().to_string()),
-        "harness_script_exists": summary.harness_script_exists
+        "harness_script_exists": summary.harness_script_exists,
+        "scheduling": summary.scheduling,
+        "state_policy": summary.state_policy,
+        "comparison": summary.comparison,
+        "retry_max_attempts": summary.retry_max_attempts
     })
 }
 

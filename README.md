@@ -17,13 +17,13 @@ The shape of each task is up to you — the runner passes it through verbatim. O
 
 ### 2. A harness (your program)
 
-Your executable that does the actual work. The runner invokes it once per trial. It reads `trial_input.json` (containing the task, variant bindings, and IDs) and writes `trial_output.json` (containing your result and outcome).
+Your executable that does the actual work. The runner invokes it once per trial. It reads `trial_input.json` (containing the task, variant bindings, and IDs) and can write `trial_output.json` (containing your result/outcome hints).
 
 ```
 your-harness --input /out/trial_input.json --output /out/trial_output.json
 ```
 
-The harness is entirely yours — a Node script, a Python module, a compiled binary. AgentLab doesn't care how it works internally.
+The harness is entirely yours — a Node script, a Python module, a compiled binary. AgentLab does not require harness-internal AgentLab-specific mapping logic.
 
 ### 3. An experiment config (`experiment.yaml`)
 
@@ -55,12 +55,16 @@ flowchart LR
   subgraph output [" run artifacts "]
     direction TB
     TDIR["trials/ (per-trial I/O)"]
+    EVID["evidence/ (runner-owned evidence records)"]
+    BMARK["benchmark/ (adapter predictions/scores/summary)"]
     ANALYSIS["analysis/ (JSONL tables)"]
   end
 
   TASKS --> PLAN
   HARNESS -.->|invoked by runner| EXEC
   TRIAL --> TDIR
+  TDIR --> EVID
+  EVID --> BMARK
   TDIR --> ANALYSIS
 ```
 
@@ -69,8 +73,9 @@ For each trial:
 1. Runner copies your project into an isolated workspace (container or local).
 2. Writes `trial_input.json` with the task data, variant bindings, and run/trial IDs.
 3. Invokes your harness command.
-4. Collects `trial_output.json`.
-5. After all trials, builds analysis tables under `.lab/runs/<run_id>/analysis/`.
+4. Captures runner-owned evidence (I/O refs, logs, snapshots, diffs, patches).
+5. Optionally invokes benchmark adapter scoring to produce `predictions.jsonl`, `scores.jsonl`, and benchmark summary.
+6. Builds analysis tables under `.lab/runs/<run_id>/analysis/` (using score records when present).
 
 **Container mode** copies your project into a Docker container and runs your harness there. The runner does not build images — you provide a pre-built image via `runtime.sandbox.image` in your experiment config or `sandboxImage()` in the SDK. If no image is set, trials run locally.
 
@@ -420,12 +425,30 @@ Each run produces a directory at `.lab/runs/<run_id>/` with:
   manifest.json                      # run metadata (runner version, timestamps)
   resolved_experiment.json           # final experiment config after overrides
   resolved_experiment.digest         # SHA-256 of resolved config
+  evidence/
+    evidence_records.jsonl           # evidence_record_v1 (runner-owned truth boundary)
+    task_chain_states.jsonl          # task_chain_state_v1 (incremental/cumulative chain diffs)
+  benchmark/
+    adapter_manifest.json            # benchmark_adapter_manifest_v1
+    predictions.jsonl                # benchmark_prediction_record_v1
+    scores.jsonl                     # benchmark_score_record_v1
+    summary.json                     # benchmark_summary_v1
   trials/
     trial_1/
       trial_input.json               # what the runner passed to your harness
-      trial_output.json              # what your harness returned
+      trial_output.json              # harness output (compatibility boundary)
+      trial_metadata.json            # effective merged policy for this task
+      evidence/
+        workspace_pre_snapshot.json
+        workspace_post_snapshot.json
+        workspace_diff_incremental.json
+        workspace_diff_cumulative.json
+        workspace_patch_incremental.json
+        workspace_patch_cumulative.json
+      harness_stdout.log
+      harness_stderr.log
       workspace/                     # copy of your project (harness ran here)
-      state/                         # pre/post state snapshots
+      state/                         # control-plane / state files
       out/                           # harness I/O directory
     trial_2/
       ...

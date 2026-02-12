@@ -38,11 +38,40 @@
       "required": ["sanitization_profile", "comparison", "replications", "random_seed", "shuffle_tasks", "max_concurrency"],
       "properties": {
         "sanitization_profile": { "type": "string", "minLength": 1 },
-        "comparison": { "type": "string", "enum": ["paired", "unpaired"] },
+        "comparison": { "type": "string", "enum": ["paired", "unpaired", "none"] },
         "replications": { "type": "integer", "minimum": 1 },
         "random_seed": { "type": "integer" },
         "shuffle_tasks": { "type": "boolean" },
-        "max_concurrency": { "type": "integer", "minimum": 1 }
+        "max_concurrency": { "type": "integer", "minimum": 1 },
+        "policies": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "scheduling": { "type": "string", "enum": ["paired_interleaved", "variant_sequential", "randomized"] },
+            "state": { "type": "string", "enum": ["isolate_per_trial", "persist_per_task", "accumulate"] },
+            "comparison": { "type": "string", "enum": ["paired", "unpaired", "none"] },
+            "retry": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["max_attempts"],
+              "properties": {
+                "max_attempts": { "type": "integer", "minimum": 1 },
+                "retry_on": {
+                  "type": "array",
+                  "items": { "type": "string", "enum": ["error", "timeout", "failure"] }
+                }
+              }
+            },
+            "pruning": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "max_consecutive_failures": { "type": "integer", "minimum": 1 }
+              }
+            }
+          },
+          "required": ["scheduling", "state", "comparison", "retry"]
+        }
       }
     },
     "baseline": {
@@ -52,6 +81,35 @@
       "properties": {
         "variant_id": { "type": "string", "minLength": 1 },
         "bindings": { "type": "object" }
+      }
+    },
+    "benchmark": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "policy": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "task_model": { "type": "string", "enum": ["independent", "dependent"] },
+            "reset_strategy": { "type": "string", "enum": ["per_trial", "per_chain", "never"] },
+            "evaluator_mode": { "type": "string", "enum": ["official", "custom"] },
+            "scoring_lifecycle": { "type": "string", "enum": ["predict_then_score", "integrated_score"] },
+            "required_evidence_classes": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 }
+            },
+            "chain_failure_policy": { "type": "string", "enum": ["stop_on_error", "continue_with_flag"] }
+          }
+        },
+        "adapter": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "command": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 },
+            "manifest": { "type": "object" }
+          }
+        }
       }
     },
     "runtime": {

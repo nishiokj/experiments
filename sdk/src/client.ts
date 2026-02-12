@@ -22,6 +22,10 @@ import type {
   PublishResponse,
   ReadAnalysisArgs,
   ReadAnalysisResponse,
+  ReadBenchmarkArgs,
+  ReadBenchmarkResponse,
+  ReadEvidenceArgs,
+  ReadEvidenceResponse,
   ReplayArgs,
   ReplayResponse,
   ResumeArgs,
@@ -215,6 +219,39 @@ export class LabClient {
     };
   }
 
+  async readEvidence(args: ReadEvidenceArgs): Promise<ReadEvidenceResponse> {
+    const base = args.cwd ? resolve(this.cwd, args.cwd, args.runDir) : resolve(this.cwd, args.runDir);
+    const evidenceDir = join(base, 'evidence');
+    const evidence = await this.readJsonl(join(evidenceDir, 'evidence_records.jsonl'));
+    const taskChains = await this.readJsonl(join(evidenceDir, 'task_chain_states.jsonl'));
+    return {
+      evidence: evidence as ReadEvidenceResponse['evidence'],
+      taskChains: taskChains as ReadEvidenceResponse['taskChains'],
+    };
+  }
+
+  async readBenchmark(args: ReadBenchmarkArgs): Promise<ReadBenchmarkResponse> {
+    const base = args.cwd ? resolve(this.cwd, args.cwd, args.runDir) : resolve(this.cwd, args.runDir);
+    const benchmarkDir = join(base, 'benchmark');
+
+    const [manifest, summary] = await Promise.all([
+      this.readJsonFileIfExists(join(benchmarkDir, 'adapter_manifest.json')),
+      this.readJsonFileIfExists(join(benchmarkDir, 'summary.json')),
+    ]);
+
+    const [predictions, scores] = await Promise.all([
+      this.readJsonl(join(benchmarkDir, 'predictions.jsonl')),
+      this.readJsonl(join(benchmarkDir, 'scores.jsonl')),
+    ]);
+
+    return {
+      manifest: manifest as ReadBenchmarkResponse['manifest'],
+      predictions: predictions as ReadBenchmarkResponse['predictions'],
+      scores: scores as ReadBenchmarkResponse['scores'],
+      summary: summary as ReadBenchmarkResponse['summary'],
+    };
+  }
+
   private async runJson<T extends JsonCommandResponse>(args: string[], options?: CommandOptions): Promise<T> {
     const result = await this.spawnCommand(args, options);
     const payload = this.parsePayload(result.stdout, result.stderr, args);
@@ -340,6 +377,36 @@ export class LabClient {
     }
 
     return parsed;
+  }
+
+  private async readJsonFileIfExists(path: string): Promise<unknown | null> {
+    try {
+      const raw = await readFile(path, 'utf8');
+      return JSON.parse(raw) as unknown;
+    } catch (error: unknown) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  private async readJsonl(path: string): Promise<unknown[]> {
+    try {
+      const raw = await readFile(path, 'utf8');
+      return raw
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0)
+        .map((line) => JSON.parse(line) as unknown);
+    } catch (error: unknown) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') {
+        return [];
+      }
+      throw error;
+    }
   }
 }
 
