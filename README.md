@@ -4,32 +4,49 @@ Experiment runner for agent and trainer systems. Runs **your code** against a da
 
 Container execution is the primary mode: trials run in a configured container image, while the runner owns scheduling, evidence capture, and benchmark wiring.
 
+## Primary SDK Boundaries (You Implement These)
+
+These are the boundaries you own in your SDK script:
+
+1. `InputMapper<TRaw> -> TaskBoundaryV1`
+2. `OutcomeMapper<TDomain> <- OutcomeBoundaryV1`
+
+Everything else is runner-owned and benchmark-adapter-owned:
+
+- Runner orchestration, container/process execution, evidence capture, chain state, retry/scheduling.
+- Benchmark adapter/evaluator prediction + scoring semantics.
+- Analysis aggregation and comparisons.
+
+`TaskBoundaryV1` is intentionally fixed:
+
+- `task`
+- `workspace_files`
+- `mount_references`
+- `limits`
+
+If inputs cannot compile into that, it is a new runner capability request, not a new task boundary type.
+
 ## What You Provide
 
-### 1. A dataset (`tasks.jsonl`)
+### 1. Raw dataset rows
 
-JSONL file. Each line is one task the runner feeds to your harness.
+Any shape you want (JSONL, DB rows, in-memory objects). Your `InputMapper` compiles each row into `task_boundary_v1`.
 
-```jsonl
-{"task_id": "task_001", "prompt": "Write a function that reverses a string", "language": "python"}
-{"task_id": "task_002", "prompt": "Implement binary search", "language": "python"}
-```
+### 2. `InputMapper` (SDK implementation)
 
-The shape of each task is up to you — the runner passes it through verbatim. Only `task_id` is required.
+Your mapper from raw row -> runner-consumable task boundary. This is your input-side boundary implementation.
 
-### 2. A harness (your program)
+### 3. A harness runtime + command
 
-Your executable that does the actual work. The runner invokes it once per trial and treats it as an external API surface: it sends trial input and captures outputs/events/filesystem effects. Benchmark scoring semantics are not harness-owned.
+Your executable does the work. Runner invokes it as an external API surface and captures what it emits (stdout/stderr/output/events/filesystem effects).
 
-```
-your-harness --input /out/trial_input.json --output /out/trial_output.json
-```
+### 4. `OutcomeMapper` (SDK implementation)
 
-The harness is entirely yours — a Node script, a Python module, a compiled binary. AgentLab does not require harness-internal benchmark-specific grading logic.
+Your mapper from runner-emitted `OutcomeBoundaryV1` -> your domain outcome shape (for grader/reporting/business logic).
 
-### 3. An experiment config (`experiment.yaml`)
+### 5. An experiment config (`experiment.yaml`)
 
-Ties it all together: which dataset, which harness command, how many repeats, what variants to compare, and what isolation posture to use. Lives at `.lab/experiment.yaml`.
+Built with `ExperimentBuilder` and written to `.lab/experiment.yaml`.
 
 ---
 
@@ -97,11 +114,12 @@ flowchart LR
 4. Runner builds `trial_input_v1` and writes canonical `trial_input.json` with IDs, task, bindings, runtime paths, and optional `ext.task_boundary_v1`.
 5. Runner invokes exactly one harness command.
    - Container mode mounts: `/workspace` (rw), `/harness` (ro project root), `/dataset` (ro), `/state` (rw), `/out` (rw), `/tmp` (tmpfs).
-   - Runner sets invocation env contract: `AGENTLAB_TRIAL_INPUT`, `AGENTLAB_TRIAL_OUTPUT`, `AGENTLAB_CONTROL_PATH`, `AGENTLAB_HARNESS_ROOT`.
+   - Runner launches the child process with env vars: `AGENTLAB_TRIAL_INPUT`, `AGENTLAB_TRIAL_OUTPUT`, `AGENTLAB_CONTROL_PATH`, `AGENTLAB_HARNESS_ROOT`.
 6. Runner resolves trial output deterministically:
    - if output file exists at `AGENTLAB_TRIAL_OUTPUT`, uses it.
    - else if last non-empty stdout line is JSON, writes that as `trial_output.json`.
    - else synthesizes an error `trial_output_v1`.
+   - Harness code can ignore those env vars entirely if it already supports stdin/stdout JSON.
 7. Runner captures evidence: stdout/stderr, optional events ref, workspace pre/post snapshots, incremental+cumulative diffs, derived patches, timing/executor metadata.
 8. Runner appends run-scope evidence boundaries:
    - `.lab/runs/<run_id>/evidence/evidence_records.jsonl`
@@ -130,101 +148,153 @@ The SDK is the primary programmatic interface. It provides a builder for experim
 cd sdk && npm install && npm run build
 ```
 
-### Build an experiment
+### Build + Run (Boundary-First Example)
 
 ```ts
-import { ExperimentBuilder, LabClient, Metric } from '@agentlab/sdk';
-import { writeFileSync, mkdirSync } from 'node:fs';
+import {
+  ExperimentBuilder,
+  LabClient,
+  Metric,
+  compileTaskBoundaries,
+  taskBoundariesToJsonl,
+  createOutcomeBoundary,
+  mapOutcome,
+  type HookEvent,
+  type InputMapper,
+  type OutcomeMapper,
+  type TrialOutput,
+} from '@agentlab/sdk';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 
+// ------------------------------------------------------------------
+// 1) Input boundary you implement: InputMapper<RawRow> -> TaskBoundaryV1
+// ------------------------------------------------------------------
+type RawRow = {
+  id: string;
+  prompt: string;
+  repo: string;
+};
+
+const rawRows: RawRow[] = [
+  { id: 'task_001', prompt: 'Fix failing tests in parser', repo: 'acme/parser' },
+  { id: 'task_002', prompt: 'Implement cache invalidation bugfix', repo: 'acme/cache' },
+];
+
+const inputMapper: InputMapper<RawRow> = {
+  map(row, { index }) {
+    return {
+      schema_version: 'task_boundary_v1',
+      task: {
+        id: row.id,
+        prompt: row.prompt,
+        repo: row.repo,
+        index,
+      },
+      workspace_files: [],
+      mount_references: [],
+      limits: {
+        max_steps: 32,
+        trial_seconds: 300,
+      },
+    };
+  },
+};
+
+const taskBoundaries = compileTaskBoundaries(rawRows, inputMapper);
+
+// experiment.yaml lives in .lab/, so dataset path below is relative to .lab/
+mkdirSync('.lab/data', { recursive: true });
+writeFileSync('.lab/data/tasks.boundary.jsonl', taskBoundariesToJsonl(taskBoundaries));
+
+// ------------------------------------------------------------------
+// 2) Build ExperimentSpec boundary with ExperimentBuilder
+// ------------------------------------------------------------------
 const builder = ExperimentBuilder.create('prompt_ab', 'Prompt A/B Test')
-  .description('Compare prompt v1 vs v2 on coding tasks')
-
-  // --- dataset ---
-  // Path is relative to your project root (the parent of .lab/).
-  .datasetJsonl('./data/tasks.jsonl', {
-    suiteId: 'coding_tasks',
+  .description('Boundary-first SDK example')
+  .datasetJsonl('./data/tasks.boundary.jsonl', {
+    suiteId: 'boundary_demo',
     splitId: 'dev',
-    limit: 50,
+    limit: taskBoundaries.length,
   })
-
-  // --- harness command ---
-  // This is YOUR program. The runner invokes it for each trial.
-  // Path is relative to your project root.
-  //
-  //   Node:   ['node', './src/harness/run-trial.js']
-  //   Python: ['python', '-m', 'my_agent.harness']
-  //   Binary: ['./bin/evaluate']
-  //
-  // If this path is wrong, every trial fails. Use `lab describe` to verify
-  // the resolved path before running.
-  .harnessCli(
-    ['node', './src/harness/run-trial.js'],
-    { integrationLevel: 'cli_events' }
-  )
-
-  // --- experiment design (defaults: profile=hermetic_functional_v2, replications=1, seed=1) ---
-  .replications(3)
-
-  // --- variants (what you're comparing) ---
+  .harnessCli(['node', './src/harness/run-trial.js'], {
+    integrationLevel: 'cli_events',
+  })
   .baseline('control', { model: 'gpt-4o', temperature: 0.0 })
   .addVariant('treatment', { model: 'gpt-4o', temperature: 0.7 })
-
-  // --- metrics ---
-  // Each metric declares exactly where it comes from.
-  //
-  // Runner auto-metrics (always tracked):
   .metric(Metric.DURATION_MS)
-  //
-  // Event-derived (auto-computed from harness hook events):
   .metric(Metric.TOKENS_IN)
   .metric(Metric.TOKENS_OUT)
-  //
-  // Output-derived (extracted from trial_output.json):
   .metric(Metric.fromOutput('success', '/outcome', {
-    primary: true, weight: 1.0, direction: 'maximize',
+    primary: true,
+    direction: 'maximize',
   }))
-  .metric(Metric.fromOutput('accuracy', '/metrics/accuracy', {
-    primary: true, weight: 1.0, direction: 'maximize',
-  }))
-  .metric(Metric.fromOutput('latency_ms', '/metrics/latency_ms', {
-    direction: 'minimize',
-  }))
-  .metric(Metric.fromOutput('cost_usd', '/metrics/cost_usd', {
-    direction: 'minimize',
-  }))
-  //
-  // Artifact-derived (computed from workspace changes):
-  .artifacts({ collect: ['**/*.py', 'output/**'], diff: true })
-  .metric(Metric.FILES_MODIFIED)
-  .metric(Metric.DIFF_LINES)
-
-  // --- guardrails (budget limits) ---
-  // Runner fails a trial if any guardrail is exceeded.
-  .guardrail(Metric.maxTokensIn(50_000))
-  .guardrail(Metric.maxDuration(300_000))
-  .guardrail(Metric.maxToolCalls(100))
-
-  // --- isolation ---
-  // 'none': no network (default, strictest)
-  // 'full': unrestricted network
   .networkMode('none')
-
-  // --- container mode (primary path) ---
-  // Pin image by digest for immutable harness runtime.
   .sandboxImage('ghcr.io/your-org/your-harness-runtime@sha256:...');
 
-// Write to disk
 mkdirSync('.lab', { recursive: true });
 writeFileSync('.lab/experiment.yaml', builder.toYaml());
 
-// Run it
 const client = new LabClient();
-const summary = await client.describe({ experiment: '.lab/experiment.yaml' });
-console.log(`Planned: ${summary.summary.total_trials} trials`);
-
 const run = await client.run({ experiment: '.lab/experiment.yaml' });
-console.log(`Done: ${run.run.run_id}`);
+console.log(`run_id=${run.run.run_id}`);
+console.log(`run_dir=${run.run.run_dir}`);
+
+// ------------------------------------------------------------------
+// 3) Outcome boundary you implement: OutcomeBoundaryV1 -> DomainOutcome
+// ------------------------------------------------------------------
+const outcomeMapper: OutcomeMapper<{
+  taskId: string;
+  pass: boolean;
+  tokensIn: number;
+}> = {
+  map(boundary) {
+    const tokensIn = boundary.run_events
+      .filter((e) => e.event_type === 'model_call_end')
+      .reduce((sum, e) => sum + (e.usage?.tokens_in ?? 0), 0);
+    return {
+      taskId: boundary.result_summary.ids.task_id,
+      pass: boundary.result_summary.outcome === 'success',
+      tokensIn,
+    };
+  },
+};
+
+const evidence = await client.readEvidence({ runDir: run.run.run_dir });
+// For brevity this maps only the first trial. In production, loop all evidence rows.
+const firstTrialId = evidence.evidence[0]?.ids.trial_id;
+if (!firstTrialId) {
+  throw new Error('No trials recorded');
+}
+
+const trialDir = `${run.run.run_dir}/trials/${firstTrialId}`;
+const trialOutput = JSON.parse(
+  readFileSync(`${trialDir}/trial_output.json`, 'utf8'),
+) as TrialOutput;
+
+let runEvents: HookEvent[] = [];
+try {
+  runEvents = readFileSync(`${trialDir}/state/harness_events.jsonl`, 'utf8')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as HookEvent);
+} catch {
+  runEvents = [];
+}
+
+const domainOutcome = await mapOutcome(
+  createOutcomeBoundary(trialOutput, runEvents),
+  outcomeMapper,
+);
+console.log(domainOutcome);
 ```
+
+Boundary intuition for this example:
+
+- `InputMapper` is the only place raw dataset semantics are translated into runner task boundaries.
+- `ExperimentBuilder` defines execution/scientific policy, not benchmark verdict logic.
+- Runner executes and captures evidence; it returns run-scope metadata (`RunResponse`) when the experiment is done.
+- `OutcomeMapper` is the only place runner-emitted boundaries are translated into your domain outcome model.
 
 ### What `harnessCli` means
 
@@ -277,6 +347,8 @@ const client = new LabClient({
 | `client.validateHooks(args)` | Validate event stream against harness manifest |
 | `client.validateSchema(args)` | Validate JSON file against schema |
 | `client.readAnalysis(args)` | Read typed analysis summary and comparisons from a run |
+| `client.readEvidence(args)` | Read run-scope evidence boundaries (`evidence_record_v1`, `task_chain_state_v1`) |
+| `client.readBenchmark(args)` | Read benchmark adapter artifacts (`manifest`, `predictions`, `scores`, `summary`) |
 
 `client.run()` / `client.runDev()` return once the entire experiment finishes. `RunResponse` is run-scoped (`run_id`, `run_dir`, artifact paths), not a list of per-trial payloads. Per-trial data lives under `.lab/runs/<run_id>/trials/` and run-scope evidence lives under `.lab/runs/<run_id>/evidence/`.
 
