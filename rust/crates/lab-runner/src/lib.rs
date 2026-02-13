@@ -1,18 +1,22 @@
 use anyhow::{anyhow, Result};
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use chrono::Utc;
 use lab_analysis::{summarize_trial, write_analysis};
 use lab_core::{canonical_json_digest, ensure_dir, sha256_bytes, sha256_file, ArtifactStore};
 use lab_hooks::{load_manifest, validate_hooks};
 use lab_provenance::{default_attestation, write_attestation};
 use lab_schemas::compile_schema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -372,6 +376,10 @@ pub struct ExperimentSummary {
     pub control_path: String,
     pub harness_script_resolved: Option<PathBuf>,
     pub harness_script_exists: bool,
+    pub scheduling: String,
+    pub state_policy: String,
+    pub comparison: String,
+    pub retry_max_attempts: usize,
 }
 
 pub fn run_experiment(path: &Path, use_container: bool) -> Result<RunResult> {
@@ -508,6 +516,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         "/ids/trial_id",
         Value::String(replay_trial_id.clone()),
     )?;
+    let task_boundary = parse_task_boundary_from_trial_input(&input)?;
 
     let dataset_src = first_file_in_dir(&parent_trial_dir.join("dataset"))?;
     let replay_trial_dir = replay_dir.join("trial_1");
@@ -529,6 +538,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     };
     let trial_paths = TrialPaths::new(&replay_trial_dir, &workspace_src, &dataset_src)?;
     trial_paths.prepare()?;
+    materialize_workspace_files(&trial_paths, &task_boundary.workspace_files)?;
 
     let input_bytes = serde_json::to_vec_pretty(&input)?;
     let canonical_input = replay_trial_dir.join("trial_input.json");
@@ -541,18 +551,24 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     let (control_path_harness, control_path_host) =
         resolve_control_paths(&harness.control_path, &trial_paths, container_mode);
     write_control_file(&control_path_host)?;
+    let dynamic_mounts = resolve_task_mounts(
+        &project_root,
+        &task_boundary.mount_references,
+        container_mode,
+    )?;
 
     let effective_network_mode = input
         .pointer("/runtime/network/mode_requested")
         .and_then(|v| v.as_str())
         .unwrap_or("none")
         .to_string();
-    let status = if container_mode {
+    let proc_result = if container_mode {
         let command = resolve_command_container(&harness.command_raw, &project_root);
         run_harness_container(
             &json_value,
             &harness,
             &trial_paths,
+            &dynamic_mounts,
             &input_path,
             &output_path,
             &control_path_harness,
@@ -571,6 +587,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
             &command,
         )?
     };
+    let status = proc_result.status;
 
     if container_mode {
         let canonical_output = replay_trial_dir.join("trial_output.json");
@@ -748,6 +765,7 @@ fn fork_trial_inner(
             "strict": strict
         }),
     )?;
+    let task_boundary = parse_task_boundary_from_trial_input(&input)?;
 
     let dataset_src = first_file_in_dir(&parent_trial_dir.join("dataset"))?;
     let fork_trial_dir = fork_dir.join("trial_1");
@@ -778,6 +796,7 @@ fn fork_trial_inner(
     };
     let trial_paths = TrialPaths::new(&fork_trial_dir, &workspace_src, &dataset_src)?;
     trial_paths.prepare()?;
+    materialize_workspace_files(&trial_paths, &task_boundary.workspace_files)?;
 
     let input_bytes = serde_json::to_vec_pretty(&input)?;
     let canonical_input = fork_trial_dir.join("trial_input.json");
@@ -790,18 +809,24 @@ fn fork_trial_inner(
     let (control_path_harness, control_path_host) =
         resolve_control_paths(&harness.control_path, &trial_paths, container_mode);
     write_control_file(&control_path_host)?;
+    let dynamic_mounts = resolve_task_mounts(
+        &project_root,
+        &task_boundary.mount_references,
+        container_mode,
+    )?;
 
     let effective_network_mode = input
         .pointer("/runtime/network/mode_requested")
         .and_then(|v| v.as_str())
         .unwrap_or("none")
         .to_string();
-    let status = if container_mode {
+    let proc_result = if container_mode {
         let command = resolve_command_container(&harness.command_raw, &project_root);
         run_harness_container(
             &json_value,
             &harness,
             &trial_paths,
+            &dynamic_mounts,
             &input_path,
             &output_path,
             &control_path_harness,
@@ -820,6 +845,7 @@ fn fork_trial_inner(
             &command,
         )?
     };
+    let status = proc_result.status;
 
     if container_mode {
         let canonical_output = fork_trial_dir.join("trial_output.json");
@@ -1495,7 +1521,12 @@ fn run_experiment_with_behavior(
     let analysis_dir = run_dir.join("analysis");
     ensure_dir(&analysis_dir)?;
 
-    let _artifact_store = ArtifactStore::new(run_dir.join("trials").join("artifacts"));
+    let evidence_dir = run_dir.join("evidence");
+    ensure_dir(&evidence_dir)?;
+    let evidence_records_path = evidence_dir.join("evidence_records.jsonl");
+    let task_chain_states_path = evidence_dir.join("task_chain_states.jsonl");
+    let artifact_store = ArtifactStore::new(run_dir.join("artifacts"));
+    let benchmark_config = parse_benchmark_config(&json_value);
 
     let harness = resolve_harness(&json_value, &project_root)?;
     validate_harness_command(&harness.command_raw, &project_root)?;
@@ -1512,235 +1543,602 @@ fn run_experiment_with_behavior(
     let mut event_counts: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
     let mut trial_event_counts: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
 
+    let policy_config = parse_policies(&json_value);
+    let random_seed = json_value
+        .pointer("/design/random_seed")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1);
+    let schedule = build_trial_schedule(
+        variants.len(),
+        tasks.len(),
+        replications,
+        policy_config.scheduling,
+        random_seed,
+    );
+
+    // Per-variant consecutive failure tracking (for pruning)
+    let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut pruned_variants: HashSet<usize> = HashSet::new();
+    let mut chain_states: BTreeMap<String, ChainRuntimeState> = BTreeMap::new();
+
     let mut trial_index: usize = 0;
     let mut run_paused = false;
-    'variants: for variant in variants {
-        for (task_idx, task) in tasks.iter().enumerate() {
-            for repl in 0..replications {
-                trial_index += 1;
-                let trial_id = format!("trial_{}", trial_index);
-                let trial_dir = trials_dir.join(&trial_id);
-                ensure_dir(&trial_dir)?;
-                write_trial_state(&trial_dir, &trial_id, "running", None, None, None)?;
-                let mut trial_guard = TrialStateGuard::new(&trial_dir, &trial_id);
+    'schedule: for slot in &schedule {
+        // Skip pruned variants
+        if pruned_variants.contains(&slot.variant_idx) {
+            continue;
+        }
 
-                let trial_paths = TrialPaths::new(&trial_dir, &project_root, &dataset_path)?;
-                trial_paths.prepare()?;
+        let variant = &variants[slot.variant_idx];
+        let task_idx = slot.task_idx;
+        let task = &tasks[task_idx];
+        let task_boundary = parse_task_boundary_from_dataset_task(task)?;
+        let repl = slot.repl_idx;
+        let task_id = task_boundary
+            .task_payload
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("task_{}", task_idx));
+        let effective_policy = resolve_effective_task_policy(
+            &policy_config,
+            &benchmark_config.policy,
+            &task_boundary.task_payload,
+        );
+        let chain_label = resolve_chain_label(
+            &task_boundary.task_payload,
+            &task_id,
+            effective_policy.state_policy,
+        );
+        let chain_key = format!("{}::{}", variant.id, chain_label);
+        let chain_fs_key = sanitize_for_fs(&chain_key);
+        let chain_step_index = chain_states
+            .get(&chain_key)
+            .map(|state| state.step_index + 1)
+            .unwrap_or(0);
 
-                let input = build_trial_input(
-                    &json_value,
-                    &workload_type,
-                    &trial_id,
-                    &variant,
-                    task_idx,
-                    repl,
-                    task,
-                    &trial_paths,
-                    container_mode,
-                );
-                let input_bytes = serde_json::to_vec_pretty(&input)?;
-                let canonical_input_path = trial_dir.join("trial_input.json");
-                atomic_write_bytes(&canonical_input_path, &input_bytes)?;
+        trial_index += 1;
+        let trial_id = format!("trial_{}", trial_index);
+        let trial_dir = trials_dir.join(&trial_id);
+        ensure_dir(&trial_dir)?;
+        write_trial_state(&trial_dir, &trial_id, "running", None, None, None)?;
+        let mut trial_guard = TrialStateGuard::new(&trial_dir, &trial_id);
 
-                let (input_path, output_path) =
-                    prepare_io_paths(&trial_paths, container_mode, &input_bytes)?;
+        let trial_paths = TrialPaths::new(&trial_dir, &project_root, &dataset_path)?;
 
-                let (control_path_harness, control_path_host) =
-                    resolve_control_paths(&harness.control_path, &trial_paths, container_mode);
-                write_run_control(
-                    &run_dir,
-                    &run_id,
-                    "running",
-                    Some(&trial_id),
-                    Some(&control_path_host),
+        trial_paths.prepare()?;
+        if !matches!(effective_policy.state_policy, StatePolicy::IsolatePerTrial) {
+            if let Some(chain_state) = chain_states.get(&chain_key) {
+                restore_workspace_from_snapshot(
+                    &chain_state.latest_snapshot_path,
+                    &trial_paths.workspace,
                 )?;
-                write_control_file(&control_path_host)?;
-
-                let mut otel_receiver = None;
-                let mut otel_manifest = None;
-                if harness.tracing_mode == Some("otlp".to_string()) {
-                    if container_mode
-                        && json_value
-                            .pointer("/runtime/network/mode")
-                            .and_then(|v| v.as_str())
-                            == Some("none")
-                    {
-                        otel_manifest = Some(json!({
-                            "schema_version": "trace_manifest_v1",
-                            "mode": "none",
-                            "reason": "network_none",
-                        }));
-                    } else {
-                        let receiver = lab_otel::OtlpReceiver::start(
-                            4318,
-                            ArtifactStore::new(trial_dir.join("artifacts")),
-                        )?;
-                        let endpoint = receiver.endpoint.clone();
-                        otel_receiver = Some(receiver);
-                        otel_manifest = Some(json!({
-                            "schema_version": "trace_manifest_v1",
-                            "mode": "otlp",
-                            "endpoint": endpoint,
-                        }));
-                    }
-                }
-
-                let status = if matches!(executor_kind, ExecutorKind::LocalDocker) {
-                    let command = resolve_command_container(&harness.command_raw, &project_root);
-                    run_harness_container(
-                        &json_value,
-                        &harness,
-                        &trial_paths,
-                        &input_path,
-                        &output_path,
-                        &control_path_harness,
-                        &command,
-                        &effective_network_mode,
-                        behavior.setup_command.as_deref(),
-                    )?
-                } else {
-                    if behavior.setup_command.is_some() {
-                        return Err(anyhow!(
-                            "setup command is only supported for container runs"
-                        ));
-                    }
-                    let command = resolve_command_local(&harness.command_raw, &project_root);
-                    run_harness_local(
-                        &harness,
-                        &trial_paths,
-                        &input_path,
-                        &output_path,
-                        &control_path_harness,
-                        &command,
-                    )?
-                };
-
-                if let Some(receiver) = otel_receiver {
-                    let records = receiver.records();
-                    receiver.stop();
-                    if let Some(mut manifest) = otel_manifest {
-                        if let Some(obj) = manifest.as_object_mut() {
-                            obj.insert("records".to_string(), serde_json::to_value(records)?);
-                        }
-                        let path = trial_dir.join("trace_manifest.json");
-                        atomic_write_json_pretty(&path, &manifest)?;
-                    }
-                }
-
-                if container_mode {
-                    let canonical_output = trial_dir.join("trial_output.json");
-                    if output_path.exists() {
-                        let output_bytes = fs::read(&output_path)?;
-                        atomic_write_bytes(&canonical_output, &output_bytes)?;
-                    }
-                }
-
-                let canonical_output = trial_dir.join("trial_output.json");
-                let trial_output: Value = if canonical_output.exists() {
-                    serde_json::from_slice(&fs::read(&canonical_output)?)?
-                } else {
-                    json!({"schema_version": "trial_output_v1", "outcome": "error"})
-                };
-
-                let task_id = task
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("task_{}", task_idx));
-                let summary = summarize_trial(
-                    &run_id,
-                    &trial_output,
-                    &trial_id,
-                    &workload_type,
-                    &variant.id,
-                    task_idx,
-                    &task_id,
-                    repl,
-                    status.clone(),
-                    container_mode,
-                    &harness.integration_level,
-                    configured_network_mode,
-                    &effective_network_mode,
-                );
-                trial_summaries.push(summary);
-
-                write_state_inventory(
-                    &trial_dir,
-                    &json_value,
-                    &harness,
-                    container_mode,
-                    &trial_paths,
-                    &resolve_exec_digest(&harness.command_raw, &project_root)?,
-                    &effective_network_mode,
-                )?;
-
-                if let Some(events_path) = harness.events_path.as_ref() {
-                    let manifest_path = resolve_harness_manifest_path(&trial_paths, container_mode);
-                    if manifest_path.exists() {
-                        let manifest = load_manifest(&manifest_path)?;
-                        let schema = compile_schema("hook_events_v1.jsonschema")?;
-                        let ev_path = resolve_event_path(events_path, &trial_paths, container_mode);
-                        if ev_path.exists() {
-                            let _ = validate_hooks(&manifest, &ev_path, &schema);
-                            let counts = count_event_types(&ev_path)?;
-                            let trial_map = trial_event_counts.entry(trial_id.clone()).or_default();
-                            for (k, v) in counts.into_iter() {
-                                *trial_map.entry(k.clone()).or_default() += v;
-                                *event_counts
-                                    .entry(variant.id.clone())
-                                    .or_default()
-                                    .entry(k)
-                                    .or_default() += v;
-                            }
-                        }
-                    }
-                }
-
-                let control_state = read_control_action(&control_path_host)?;
-                let pause_requested = control_state
-                    .as_ref()
-                    .map(|(action, requested_by, _)| {
-                        action == "stop" && requested_by == "lab_pause"
-                    })
-                    .unwrap_or(false);
-                let pause_label = control_state
-                    .as_ref()
-                    .and_then(|(_, _, label)| label.as_deref());
-                let outcome = trial_output
-                    .get("outcome")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("error");
-                if pause_requested {
-                    write_trial_state(
-                        &trial_dir,
-                        &trial_id,
-                        "paused",
-                        pause_label,
-                        pause_label,
-                        Some("paused_by_user"),
-                    )?;
-                    trial_guard.done = true;
-                    write_run_control(
-                        &run_dir,
-                        &run_id,
-                        "paused",
-                        Some(&trial_id),
-                        Some(&control_path_host),
-                    )?;
-                    run_paused = true;
-                    break 'variants;
-                } else if status == "0" && outcome != "error" {
-                    trial_guard.complete("completed", None)?;
-                } else if status != "0" {
-                    trial_guard.complete("failed", Some("harness_exit_nonzero"))?;
-                } else {
-                    trial_guard.complete("failed", Some("trial_output_error"))?;
-                }
-                write_run_control(&run_dir, &run_id, "running", None, None)?;
-                apply_materialization_policy(&trial_dir, materialize_mode)?;
             }
         }
+
+        materialize_workspace_files(&trial_paths, &task_boundary.workspace_files)?;
+        let dynamic_mounts = resolve_task_mounts(
+            &project_root,
+            &task_boundary.mount_references,
+            container_mode,
+        )?;
+
+        let input = build_trial_input(
+            &json_value,
+            &run_id,
+            &workload_type,
+            &trial_id,
+            variant,
+            task_idx,
+            repl,
+            &task_boundary,
+            &trial_paths,
+            container_mode,
+        );
+        let input_bytes = serde_json::to_vec_pretty(&input)?;
+        let canonical_input_path = trial_dir.join("trial_input.json");
+        atomic_write_bytes(&canonical_input_path, &input_bytes)?;
+
+        let trial_metadata = json!({
+            "schema_version": "trial_metadata_v1",
+            "ids": {
+                "run_id": run_id.as_str(),
+                "trial_id": trial_id.as_str(),
+                "variant_id": variant.id.as_str(),
+                "task_id": task_id.as_str(),
+                "repl_idx": repl
+            },
+            "policy_merge": {
+                "global_defaults": {
+                    "state_policy": "isolate_per_trial",
+                    "task_model": "independent",
+                    "scoring_lifecycle": "predict_then_score",
+                    "required_evidence_classes": []
+                },
+                "experiment_type_policy": {
+                    "state_policy": match policy_config.state {
+                        StatePolicy::IsolatePerTrial => "isolate_per_trial",
+                        StatePolicy::PersistPerTask => "persist_per_task",
+                        StatePolicy::Accumulate => "accumulate",
+                    }
+                },
+                "benchmark_type_policy": {
+                    "task_model": benchmark_config.policy.task_model.as_str(),
+                    "scoring_lifecycle": benchmark_config.policy.scoring_lifecycle.as_str(),
+                    "required_evidence_classes": benchmark_config.policy.required_evidence_classes.clone()
+                },
+                "task_override": task_boundary.task_payload.get("policy_override").cloned(),
+                "effective": {
+                    "state_policy": match effective_policy.state_policy {
+                        StatePolicy::IsolatePerTrial => "isolate_per_trial",
+                        StatePolicy::PersistPerTask => "persist_per_task",
+                        StatePolicy::Accumulate => "accumulate",
+                    },
+                    "task_model": effective_policy.task_model.as_str(),
+                    "scoring_lifecycle": effective_policy.scoring_lifecycle.as_str(),
+                    "required_evidence_classes": effective_policy.required_evidence_classes.clone(),
+                    "chain_failure_policy": effective_policy.chain_failure_policy.as_str(),
+                }
+            },
+            "chain": {
+                "chain_id": chain_key.as_str(),
+                "step_index": chain_step_index
+            }
+        });
+        atomic_write_json_pretty(&trial_dir.join("trial_metadata.json"), &trial_metadata)?;
+
+        let (input_path, output_path) =
+            prepare_io_paths(&trial_paths, container_mode, &input_bytes)?;
+
+        let (control_path_harness, control_path_host) =
+            resolve_control_paths(&harness.control_path, &trial_paths, container_mode);
+        write_run_control(
+            &run_dir,
+            &run_id,
+            "running",
+            Some(&trial_id),
+            Some(&control_path_host),
+        )?;
+        write_control_file(&control_path_host)?;
+
+        let trial_evidence_dir = trial_dir.join("evidence");
+        ensure_dir(&trial_evidence_dir)?;
+        let chains_dir = evidence_dir.join("chains").join(&chain_fs_key);
+        ensure_dir(&chains_dir)?;
+
+        let pre_snapshot_manifest = collect_workspace_snapshot_manifest(&trial_paths.workspace)?;
+        let pre_snapshot_path = trial_evidence_dir.join("workspace_pre_snapshot.json");
+        atomic_write_json_pretty(&pre_snapshot_path, &pre_snapshot_manifest)?;
+        let pre_snapshot_ref = artifact_store.put_file(&pre_snapshot_path)?;
+
+        let (chain_root_snapshot_ref, chain_root_snapshot_path) =
+            if let Some(existing) = chain_states.get(&chain_key) {
+                (
+                    existing.chain_root_snapshot_ref.clone(),
+                    existing.chain_root_snapshot_path.clone(),
+                )
+            } else {
+                let root_workspace = chains_dir.join("chain_root_workspace");
+                if root_workspace.exists() {
+                    fs::remove_dir_all(&root_workspace)?;
+                }
+                ensure_dir(&root_workspace)?;
+                copy_dir_filtered(&trial_paths.workspace, &root_workspace, &[])?;
+                (pre_snapshot_ref.clone(), root_workspace)
+            };
+
+        // Retry loop
+        let mut status = String::new();
+        let mut trial_output: Value =
+            json!({"schema_version": "trial_output_v1", "outcome": "error"});
+        let trial_started_at = Instant::now();
+        for attempt in 0..policy_config.retry_max_attempts {
+            let mut otel_receiver = None;
+            let mut otel_manifest = None;
+            if harness.tracing_mode == Some("otlp".to_string()) {
+                if container_mode
+                    && json_value
+                        .pointer("/runtime/network/mode")
+                        .and_then(|v| v.as_str())
+                        == Some("none")
+                {
+                    otel_manifest = Some(json!({
+                        "schema_version": "trace_manifest_v1",
+                        "mode": "none",
+                        "reason": "network_none",
+                    }));
+                } else {
+                    let receiver = lab_otel::OtlpReceiver::start(
+                        4318,
+                        ArtifactStore::new(trial_dir.join("artifacts")),
+                    )?;
+                    let endpoint = receiver.endpoint.clone();
+                    otel_receiver = Some(receiver);
+                    otel_manifest = Some(json!({
+                        "schema_version": "trace_manifest_v1",
+                        "mode": "otlp",
+                        "endpoint": endpoint,
+                    }));
+                }
+            }
+
+            let proc_result = if matches!(executor_kind, ExecutorKind::LocalDocker) {
+                let command = resolve_command_container(&harness.command_raw, &project_root);
+                run_harness_container(
+                    &json_value,
+                    &harness,
+                    &trial_paths,
+                    &dynamic_mounts,
+                    &input_path,
+                    &output_path,
+                    &control_path_harness,
+                    &command,
+                    &effective_network_mode,
+                    behavior.setup_command.as_deref(),
+                )?
+            } else {
+                if behavior.setup_command.is_some() {
+                    return Err(anyhow!(
+                        "setup command is only supported for container runs"
+                    ));
+                }
+                let command = resolve_command_local(&harness.command_raw, &project_root);
+                run_harness_local(
+                    &harness,
+                    &trial_paths,
+                    &input_path,
+                    &output_path,
+                    &control_path_harness,
+                    &command,
+                )?
+            };
+            status = proc_result.status;
+            atomic_write_bytes(
+                &trial_dir.join("harness_stdout.log"),
+                proc_result.stdout.as_bytes(),
+            )?;
+            atomic_write_bytes(
+                &trial_dir.join("harness_stderr.log"),
+                proc_result.stderr.as_bytes(),
+            )?;
+
+            if let Some(receiver) = otel_receiver {
+                let records = receiver.records();
+                receiver.stop();
+                if let Some(mut manifest) = otel_manifest {
+                    if let Some(obj) = manifest.as_object_mut() {
+                        obj.insert("records".to_string(), serde_json::to_value(records)?);
+                    }
+                    let path = trial_dir.join("trace_manifest.json");
+                    atomic_write_json_pretty(&path, &manifest)?;
+                }
+            }
+
+            if container_mode {
+                let canonical_output = trial_dir.join("trial_output.json");
+                if output_path.exists() {
+                    let output_bytes = fs::read(&output_path)?;
+                    atomic_write_bytes(&canonical_output, &output_bytes)?;
+                }
+            }
+
+            let canonical_output = trial_dir.join("trial_output.json");
+            trial_output = if canonical_output.exists() {
+                serde_json::from_slice(&fs::read(&canonical_output)?)?
+            } else {
+                json!({"schema_version": "trial_output_v1", "outcome": "error"})
+            };
+
+            let outcome = trial_output
+                .get("outcome")
+                .and_then(|v| v.as_str())
+                .unwrap_or("error");
+
+            // Check if retry is needed (skip on last attempt)
+            let is_last_attempt = attempt + 1 >= policy_config.retry_max_attempts;
+            if !is_last_attempt && should_retry_outcome(outcome, &status, &policy_config.retry_on) {
+                continue; // retry
+            }
+            break; // success or exhausted retries
+        }
+
+        let post_snapshot_manifest = collect_workspace_snapshot_manifest(&trial_paths.workspace)?;
+        let post_snapshot_path = trial_evidence_dir.join("workspace_post_snapshot.json");
+        atomic_write_json_pretty(&post_snapshot_path, &post_snapshot_manifest)?;
+        let post_snapshot_ref = artifact_store.put_file(&post_snapshot_path)?;
+
+        let chain_root_snapshot_manifest =
+            collect_workspace_snapshot_manifest(&chain_root_snapshot_path)?;
+
+        let diff_incremental = diff_workspace_snapshots(&pre_snapshot_manifest, &post_snapshot_manifest);
+        let diff_cumulative = diff_workspace_snapshots(&chain_root_snapshot_manifest, &post_snapshot_manifest);
+        let patch_incremental = derive_patch_from_diff(&diff_incremental);
+        let patch_cumulative = derive_patch_from_diff(&diff_cumulative);
+
+        let diff_incremental_path = trial_evidence_dir.join("workspace_diff_incremental.json");
+        let diff_cumulative_path = trial_evidence_dir.join("workspace_diff_cumulative.json");
+        let patch_incremental_path = trial_evidence_dir.join("workspace_patch_incremental.json");
+        let patch_cumulative_path = trial_evidence_dir.join("workspace_patch_cumulative.json");
+        atomic_write_json_pretty(&diff_incremental_path, &diff_incremental)?;
+        atomic_write_json_pretty(&diff_cumulative_path, &diff_cumulative)?;
+        atomic_write_json_pretty(&patch_incremental_path, &patch_incremental)?;
+        atomic_write_json_pretty(&patch_cumulative_path, &patch_cumulative)?;
+
+        let diff_incremental_ref = artifact_store.put_file(&diff_incremental_path)?;
+        let diff_cumulative_ref = artifact_store.put_file(&diff_cumulative_path)?;
+        let patch_incremental_ref = artifact_store.put_file(&patch_incremental_path)?;
+        let patch_cumulative_ref = artifact_store.put_file(&patch_cumulative_path)?;
+
+        let post_workspace_snapshot_dir = chains_dir.join(format!(
+            "step_{:06}_{}_workspace",
+            chain_step_index,
+            sanitize_for_fs(&trial_id)
+        ));
+        if post_workspace_snapshot_dir.exists() {
+            fs::remove_dir_all(&post_workspace_snapshot_dir)?;
+        }
+        ensure_dir(&post_workspace_snapshot_dir)?;
+        copy_dir_filtered(&trial_paths.workspace, &post_workspace_snapshot_dir, &[])?;
+
+        if !matches!(effective_policy.state_policy, StatePolicy::IsolatePerTrial) {
+            chain_states.insert(
+                chain_key.clone(),
+                ChainRuntimeState {
+                    chain_root_snapshot_ref: chain_root_snapshot_ref.clone(),
+                    chain_root_snapshot_path: chain_root_snapshot_path.clone(),
+                    latest_snapshot_ref: post_snapshot_ref.clone(),
+                    latest_snapshot_path: post_workspace_snapshot_dir.clone(),
+                    step_index: chain_step_index,
+                },
+            );
+        }
+
+        let canonical_output = trial_dir.join("trial_output.json");
+        let trial_input_ref = artifact_store.put_file(&canonical_input_path)?;
+        let trial_output_ref = artifact_store.put_file(&canonical_output)?;
+
+        let stdout_path = trial_dir.join("harness_stdout.log");
+        let stderr_path = trial_dir.join("harness_stderr.log");
+        let stdout_ref = if stdout_path.exists() {
+            Some(artifact_store.put_file(&stdout_path)?)
+        } else {
+            None
+        };
+        let stderr_ref = if stderr_path.exists() {
+            Some(artifact_store.put_file(&stderr_path)?)
+        } else {
+            None
+        };
+
+        let hook_events_path = harness
+            .events_path
+            .as_ref()
+            .map(|path| resolve_event_path(path, &trial_paths, container_mode))
+            .filter(|path| path.exists());
+        let hook_events_ref = if let Some(path) = hook_events_path.as_ref() {
+            Some(artifact_store.put_file(path)?)
+        } else {
+            None
+        };
+
+        let trial_duration_ms = trial_started_at.elapsed().as_secs_f64() * 1000.0;
+
+        let evidence_record = json!({
+            "schema_version": "evidence_record_v1",
+            "ts": Utc::now().to_rfc3339(),
+            "ids": {
+                "run_id": run_id.as_str(),
+                "trial_id": trial_id.as_str(),
+                "variant_id": variant.id.as_str(),
+                "task_id": task_id.as_str(),
+                "repl_idx": repl
+            },
+            "policy": {
+                "state_policy": match effective_policy.state_policy {
+                    StatePolicy::IsolatePerTrial => "isolate_per_trial",
+                    StatePolicy::PersistPerTask => "persist_per_task",
+                    StatePolicy::Accumulate => "accumulate",
+                },
+                "task_model": effective_policy.task_model.as_str(),
+                "chain_id": chain_key.as_str(),
+                "chain_step_index": chain_step_index
+            },
+            "runtime": {
+                "executor": executor_kind.as_str(),
+                "container_mode": container_mode,
+                "exit_status": status.as_str(),
+                "duration_ms": trial_duration_ms
+            },
+            "evidence": {
+                "trial_input_ref": trial_input_ref.clone(),
+                "trial_output_ref": trial_output_ref.clone(),
+                "stdout_ref": stdout_ref.clone(),
+                "stderr_ref": stderr_ref.clone(),
+                "hook_events_ref": hook_events_ref.clone(),
+                "harness_request_ref": trial_input_ref.clone(),
+                "harness_response_ref": trial_output_ref.clone(),
+                "workspace_pre_ref": pre_snapshot_ref.clone(),
+                "workspace_post_ref": post_snapshot_ref.clone(),
+                "diff_incremental_ref": diff_incremental_ref.clone(),
+                "diff_cumulative_ref": diff_cumulative_ref.clone(),
+                "patch_incremental_ref": patch_incremental_ref.clone(),
+                "patch_cumulative_ref": patch_cumulative_ref.clone()
+            },
+            "paths": {
+                "trial_dir": rel_to_run_dir(&trial_dir, &run_dir),
+                "trial_input": rel_to_run_dir(&canonical_input_path, &run_dir),
+                "trial_output": rel_to_run_dir(&canonical_output, &run_dir),
+                "stdout": rel_to_run_dir(&stdout_path, &run_dir),
+                "stderr": rel_to_run_dir(&stderr_path, &run_dir),
+                "hook_events": hook_events_path.as_ref().map(|p| rel_to_run_dir(p, &run_dir)),
+                "workspace_pre_snapshot": rel_to_run_dir(&pre_snapshot_path, &run_dir),
+                "workspace_post_snapshot": rel_to_run_dir(&post_snapshot_path, &run_dir),
+                "diff_incremental": rel_to_run_dir(&diff_incremental_path, &run_dir),
+                "diff_cumulative": rel_to_run_dir(&diff_cumulative_path, &run_dir),
+                "patch_incremental": rel_to_run_dir(&patch_incremental_path, &run_dir),
+                "patch_cumulative": rel_to_run_dir(&patch_cumulative_path, &run_dir)
+            }
+        });
+
+        validate_required_evidence_classes(
+            &evidence_record,
+            &effective_policy.required_evidence_classes,
+        )?;
+        append_jsonl(&evidence_records_path, &evidence_record)?;
+
+        let chain_state_record = json!({
+            "schema_version": "task_chain_state_v1",
+            "ts": Utc::now().to_rfc3339(),
+            "run_id": run_id.as_str(),
+            "chain_id": chain_key.as_str(),
+            "task_model": effective_policy.task_model.as_str(),
+            "step_index": chain_step_index,
+            "ids": {
+                "trial_id": trial_id.as_str(),
+                "variant_id": variant.id.as_str(),
+                "task_id": task_id.as_str(),
+                "repl_idx": repl
+            },
+            "snapshots": {
+                "chain_root_ref": chain_root_snapshot_ref,
+                "prev_ref": pre_snapshot_ref,
+                "post_ref": post_snapshot_ref
+            },
+            "diffs": {
+                "incremental_ref": diff_incremental_ref,
+                "cumulative_ref": diff_cumulative_ref,
+                "patch_incremental_ref": patch_incremental_ref,
+                "patch_cumulative_ref": patch_cumulative_ref
+            },
+            "ext": {
+                "chain_fs_key": chain_fs_key,
+                "latest_snapshot_ref": chain_states
+                    .get(&chain_key)
+                    .map(|state| state.latest_snapshot_ref.clone())
+            }
+        });
+        append_jsonl(&task_chain_states_path, &chain_state_record)?;
+
+        let summary = summarize_trial(
+            &run_id,
+            &trial_output,
+            &trial_id,
+            &workload_type,
+            &variant.id,
+            task_idx,
+            &task_id,
+            repl,
+            status.clone(),
+            container_mode,
+            &harness.integration_level,
+            configured_network_mode,
+            &effective_network_mode,
+        );
+        trial_summaries.push(summary);
+
+        write_state_inventory(
+            &trial_dir,
+            &json_value,
+            &harness,
+            container_mode,
+            &trial_paths,
+            &resolve_exec_digest(&harness.command_raw, &project_root)?,
+            &effective_network_mode,
+        )?;
+
+        if let Some(events_path) = harness.events_path.as_ref() {
+            let manifest_path = resolve_harness_manifest_path(&trial_paths, container_mode);
+            if manifest_path.exists() {
+                let manifest = load_manifest(&manifest_path)?;
+                let schema = compile_schema("hook_events_v1.jsonschema")?;
+                let ev_path = resolve_event_path(events_path, &trial_paths, container_mode);
+                if ev_path.exists() {
+                    let _ = validate_hooks(&manifest, &ev_path, &schema);
+                    let counts = count_event_types(&ev_path)?;
+                    let trial_map = trial_event_counts.entry(trial_id.clone()).or_default();
+                    for (k, v) in counts.into_iter() {
+                        *trial_map.entry(k.clone()).or_default() += v;
+                        *event_counts
+                            .entry(variant.id.clone())
+                            .or_default()
+                            .entry(k)
+                            .or_default() += v;
+                    }
+                }
+            }
+        }
+
+        let control_state = read_control_action(&control_path_host)?;
+        let pause_requested = control_state
+            .as_ref()
+            .map(|(action, requested_by, _)| action == "stop" && requested_by == "lab_pause")
+            .unwrap_or(false);
+        let pause_label = control_state
+            .as_ref()
+            .and_then(|(_, _, label)| label.as_deref());
+        let outcome = trial_output
+            .get("outcome")
+            .and_then(|v| v.as_str())
+            .unwrap_or("error");
+        if pause_requested {
+            write_trial_state(
+                &trial_dir,
+                &trial_id,
+                "paused",
+                pause_label,
+                pause_label,
+                Some("paused_by_user"),
+            )?;
+            trial_guard.done = true;
+            write_run_control(
+                &run_dir,
+                &run_id,
+                "paused",
+                Some(&trial_id),
+                Some(&control_path_host),
+            )?;
+            run_paused = true;
+            break 'schedule;
+        } else if status == "0" && outcome != "error" {
+            trial_guard.complete("completed", None)?;
+            *consecutive_failures.entry(slot.variant_idx).or_default() = 0;
+        } else if status != "0" {
+            trial_guard.complete("failed", Some("harness_exit_nonzero"))?;
+            *consecutive_failures.entry(slot.variant_idx).or_default() += 1;
+        } else {
+            trial_guard.complete("failed", Some("trial_output_error"))?;
+            *consecutive_failures.entry(slot.variant_idx).or_default() += 1;
+        }
+
+        // Pruning check
+        if let Some(max_failures) = policy_config.pruning_max_consecutive_failures {
+            let count = consecutive_failures
+                .get(&slot.variant_idx)
+                .copied()
+                .unwrap_or(0);
+            if count >= max_failures {
+                pruned_variants.insert(slot.variant_idx);
+            }
+        }
+
+        write_run_control(&run_dir, &run_id, "running", None, None)?;
+        apply_materialization_policy(&trial_dir, materialize_mode)?;
     }
+
+    validate_jsonl_against_schema("evidence_record_v1.jsonschema", &evidence_records_path)?;
+    validate_jsonl_against_schema("task_chain_state_v1.jsonschema", &task_chain_states_path)?;
+
+    let benchmark_artifacts = process_benchmark_outputs(
+        &project_root,
+        &run_dir,
+        &run_id,
+        &trial_summaries,
+        &benchmark_config,
+        &evidence_records_path,
+        &task_chain_states_path,
+    )?;
+
+    apply_score_records_to_trial_summaries(&mut trial_summaries, &benchmark_artifacts.scores_path)?;
 
     write_analysis(
         &analysis_dir,
@@ -1843,6 +2241,14 @@ pub fn describe_experiment_with_overrides(
         .as_ref()
         .map(|p| p.exists())
         .unwrap_or(true);
+
+    let policy_config = parse_policies(&json_value);
+    let comparison = json_value
+        .pointer("/design/comparison")
+        .and_then(|v| v.as_str())
+        .unwrap_or("paired")
+        .to_string();
+
     Ok(ExperimentSummary {
         exp_id,
         workload_type,
@@ -1861,8 +2267,929 @@ pub fn describe_experiment_with_overrides(
         control_path: harness.control_path,
         harness_script_resolved,
         harness_script_exists,
+        scheduling: match policy_config.scheduling {
+            SchedulingPolicy::PairedInterleaved => "paired_interleaved".to_string(),
+            SchedulingPolicy::VariantSequential => "variant_sequential".to_string(),
+            SchedulingPolicy::Randomized => "randomized".to_string(),
+        },
+        state_policy: match policy_config.state {
+            StatePolicy::IsolatePerTrial => "isolate_per_trial".to_string(),
+            StatePolicy::PersistPerTask => "persist_per_task".to_string(),
+            StatePolicy::Accumulate => "accumulate".to_string(),
+        },
+        comparison,
+        retry_max_attempts: policy_config.retry_max_attempts,
     })
 }
+
+// ---------------------------------------------------------------------------
+// Trial scheduling
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchedulingPolicy {
+    PairedInterleaved,
+    VariantSequential,
+    Randomized,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatePolicy {
+    IsolatePerTrial,
+    PersistPerTask,
+    Accumulate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskModel {
+    Independent,
+    Dependent,
+}
+
+impl TaskModel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Independent => "independent",
+            Self::Dependent => "dependent",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BenchmarkPolicyConfig {
+    task_model: TaskModel,
+    scoring_lifecycle: String,
+    evaluator_mode: String,
+    required_evidence_classes: Vec<String>,
+    chain_failure_policy: String,
+}
+
+impl Default for BenchmarkPolicyConfig {
+    fn default() -> Self {
+        Self {
+            task_model: TaskModel::Independent,
+            scoring_lifecycle: "predict_then_score".to_string(),
+            evaluator_mode: "custom".to_string(),
+            required_evidence_classes: Vec::new(),
+            chain_failure_policy: "continue_with_flag".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BenchmarkAdapterConfig {
+    command: Vec<String>,
+    manifest: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BenchmarkConfig {
+    policy: BenchmarkPolicyConfig,
+    adapter: Option<BenchmarkAdapterConfig>,
+}
+
+#[derive(Debug, Clone)]
+struct EffectiveTaskPolicy {
+    state_policy: StatePolicy,
+    task_model: TaskModel,
+    scoring_lifecycle: String,
+    required_evidence_classes: Vec<String>,
+    chain_failure_policy: String,
+}
+
+#[derive(Debug, Clone)]
+struct ChainRuntimeState {
+    chain_root_snapshot_ref: String,
+    chain_root_snapshot_path: PathBuf,
+    latest_snapshot_ref: String,
+    latest_snapshot_path: PathBuf,
+    step_index: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PolicyConfig {
+    scheduling: SchedulingPolicy,
+    state: StatePolicy,
+    retry_max_attempts: usize,
+    retry_on: Vec<String>,
+    pruning_max_consecutive_failures: Option<usize>,
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            scheduling: SchedulingPolicy::VariantSequential,
+            state: StatePolicy::IsolatePerTrial,
+            retry_max_attempts: 1,
+            retry_on: vec![],
+            pruning_max_consecutive_failures: None,
+        }
+    }
+}
+
+fn parse_policies(json_value: &Value) -> PolicyConfig {
+    let policies = json_value.pointer("/design/policies");
+    let Some(p) = policies else {
+        return PolicyConfig::default();
+    };
+
+    let scheduling = match p.pointer("/scheduling").and_then(|v| v.as_str()) {
+        Some("paired_interleaved") => SchedulingPolicy::PairedInterleaved,
+        Some("randomized") => SchedulingPolicy::Randomized,
+        _ => SchedulingPolicy::VariantSequential,
+    };
+    let state = match p.pointer("/state").and_then(|v| v.as_str()) {
+        Some("persist_per_task") => StatePolicy::PersistPerTask,
+        Some("accumulate") => StatePolicy::Accumulate,
+        _ => StatePolicy::IsolatePerTrial,
+    };
+    let retry_max_attempts = p
+        .pointer("/retry/max_attempts")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1) as usize;
+    let retry_on = p
+        .pointer("/retry/retry_on")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let pruning_max_consecutive_failures = p
+        .pointer("/pruning/max_consecutive_failures")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+
+    PolicyConfig {
+        scheduling,
+        state,
+        retry_max_attempts,
+        retry_on,
+        pruning_max_consecutive_failures,
+    }
+}
+
+fn parse_task_model(value: Option<&str>) -> TaskModel {
+    match value {
+        Some("dependent") => TaskModel::Dependent,
+        _ => TaskModel::Independent,
+    }
+}
+
+fn parse_state_policy_value(value: Option<&str>) -> Option<StatePolicy> {
+    match value {
+        Some("isolate_per_trial") => Some(StatePolicy::IsolatePerTrial),
+        Some("persist_per_task") => Some(StatePolicy::PersistPerTask),
+        Some("accumulate") => Some(StatePolicy::Accumulate),
+        _ => None,
+    }
+}
+
+fn parse_benchmark_config(json_value: &Value) -> BenchmarkConfig {
+    let benchmark_root = json_value.pointer("/benchmark");
+    let Some(root) = benchmark_root else {
+        return BenchmarkConfig::default();
+    };
+
+    let policy = root.pointer("/policy");
+    let mut policy_config = BenchmarkPolicyConfig::default();
+    if let Some(p) = policy {
+        policy_config.task_model = parse_task_model(p.pointer("/task_model").and_then(|v| v.as_str()));
+        if let Some(v) = p.pointer("/scoring_lifecycle").and_then(|v| v.as_str()) {
+            policy_config.scoring_lifecycle = v.to_string();
+        }
+        if let Some(v) = p.pointer("/evaluator_mode").and_then(|v| v.as_str()) {
+            policy_config.evaluator_mode = v.to_string();
+        }
+        if let Some(v) = p.pointer("/chain_failure_policy").and_then(|v| v.as_str()) {
+            policy_config.chain_failure_policy = v.to_string();
+        }
+        if let Some(arr) = p
+            .pointer("/required_evidence_classes")
+            .and_then(|v| v.as_array())
+        {
+            policy_config.required_evidence_classes = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+        }
+    }
+
+    let adapter = root.pointer("/adapter").and_then(|a| {
+        let command = a
+            .pointer("/command")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if command.is_empty() {
+            return None;
+        }
+        let manifest = a.pointer("/manifest").cloned();
+        Some(BenchmarkAdapterConfig { command, manifest })
+    });
+
+    BenchmarkConfig {
+        policy: policy_config,
+        adapter,
+    }
+}
+
+fn resolve_effective_task_policy(
+    experiment_policy: &PolicyConfig,
+    benchmark_policy: &BenchmarkPolicyConfig,
+    task_payload: &Value,
+) -> EffectiveTaskPolicy {
+    let override_obj = task_payload
+        .get("policy_override")
+        .and_then(|v| v.as_object());
+
+    let state_override = override_obj
+        .and_then(|o| o.get("state_policy"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| parse_state_policy_value(Some(s)));
+    let task_model_override = override_obj
+        .and_then(|o| o.get("task_model"))
+        .and_then(|v| v.as_str())
+        .map(|s| parse_task_model(Some(s)));
+    let scoring_lifecycle_override = override_obj
+        .and_then(|o| o.get("scoring_lifecycle"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let chain_failure_override = override_obj
+        .and_then(|o| o.get("chain_failure_policy"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let required_evidence_override = override_obj
+        .and_then(|o| o.get("required_evidence_classes"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        });
+
+    EffectiveTaskPolicy {
+        state_policy: state_override.unwrap_or(experiment_policy.state),
+        task_model: task_model_override.unwrap_or(benchmark_policy.task_model),
+        scoring_lifecycle: scoring_lifecycle_override
+            .unwrap_or_else(|| benchmark_policy.scoring_lifecycle.clone()),
+        required_evidence_classes: required_evidence_override
+            .unwrap_or_else(|| benchmark_policy.required_evidence_classes.clone()),
+        chain_failure_policy: chain_failure_override
+            .unwrap_or_else(|| benchmark_policy.chain_failure_policy.clone()),
+    }
+}
+
+fn validate_required_evidence_classes(record: &Value, required: &[String]) -> Result<()> {
+    if required.is_empty() {
+        return Ok(());
+    }
+    for class_name in required {
+        let pointer = format!("/evidence/{}", class_name);
+        let value = record.pointer(&pointer);
+        let missing = match value {
+            None => true,
+            Some(Value::Null) => true,
+            Some(Value::String(s)) => s.trim().is_empty(),
+            _ => false,
+        };
+        if missing {
+            return Err(anyhow!(
+                "missing required evidence class '{}'; pointer {}",
+                class_name,
+                pointer
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct BenchmarkArtifactsPaths {
+    scores_path: PathBuf,
+}
+
+fn normalize_benchmark_manifest(
+    run_id: &str,
+    manifest: Option<Value>,
+    policy: &BenchmarkPolicyConfig,
+) -> Value {
+    let mut normalized = manifest.unwrap_or_else(|| json!({}));
+    if !normalized.is_object() {
+        normalized = json!({});
+    }
+    let obj = normalized.as_object_mut().expect("manifest object");
+
+    obj.entry("schema_version".to_string())
+        .or_insert_with(|| json!("benchmark_adapter_manifest_v1"));
+    obj.entry("created_at".to_string())
+        .or_insert_with(|| json!(Utc::now().to_rfc3339()));
+    obj.entry("adapter_id".to_string())
+        .or_insert_with(|| json!("runner_passthrough"));
+    obj.entry("adapter_version".to_string())
+        .or_insert_with(|| json!("0.1.0"));
+
+    if !obj.contains_key("benchmark") {
+        obj.insert(
+            "benchmark".to_string(),
+            json!({
+                "name": "unspecified_benchmark",
+                "version": "unknown",
+                "split": "unknown"
+            }),
+        );
+    } else if let Some(benchmark_obj) = obj.get_mut("benchmark").and_then(|v| v.as_object_mut()) {
+        benchmark_obj
+            .entry("name".to_string())
+            .or_insert_with(|| json!("unspecified_benchmark"));
+        benchmark_obj
+            .entry("split".to_string())
+            .or_insert_with(|| json!("unknown"));
+    }
+
+    obj.entry("execution_mode".to_string())
+        .or_insert_with(|| json!(policy.scoring_lifecycle.clone()));
+    obj.entry("record_schemas".to_string()).or_insert_with(|| {
+        json!({
+            "prediction": "benchmark_prediction_record_v1",
+            "score": "benchmark_score_record_v1"
+        })
+    });
+    obj.entry("evaluator".to_string()).or_insert_with(|| {
+        json!({
+            "name": "runner_passthrough",
+            "version": "0.1.0",
+            "mode": policy.evaluator_mode
+        })
+    });
+    obj.entry("ext".to_string())
+        .or_insert_with(|| json!({"run_id": run_id}));
+
+    normalized
+}
+
+fn benchmark_identity_from_manifest(manifest: &Value) -> (String, String, Option<String>, String) {
+    let adapter_id = manifest
+        .pointer("/adapter_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("runner_passthrough")
+        .to_string();
+    let name = manifest
+        .pointer("/benchmark/name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unspecified_benchmark")
+        .to_string();
+    let version = manifest
+        .pointer("/benchmark/version")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let split = manifest
+        .pointer("/benchmark/split")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    (adapter_id, name, version, split)
+}
+
+fn read_jsonl_records(path: &Path) -> Result<Vec<Value>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let data = fs::read_to_string(path)?;
+    let mut rows = Vec::new();
+    for line in data.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        rows.push(serde_json::from_str::<Value>(line)?);
+    }
+    Ok(rows)
+}
+
+fn write_jsonl_records(path: &Path, rows: &[Value]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    let mut file = fs::File::create(path)?;
+    for row in rows {
+        serde_json::to_writer(&mut file, row)?;
+        writeln!(&mut file)?;
+    }
+    Ok(())
+}
+
+fn validate_json_file_against_schema(schema_name: &str, path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Err(anyhow!(
+            "required artifact missing for schema {}: {}",
+            schema_name,
+            path.display()
+        ));
+    }
+    let schema = compile_schema(schema_name)?;
+    let raw = fs::read_to_string(path)?;
+    let value: Value = serde_json::from_str(&raw)?;
+    if let Err(errors) = schema.validate(&value) {
+        let msgs = errors.map(|e| e.to_string()).collect::<Vec<_>>().join("; ");
+        return Err(anyhow!(
+            "schema validation failed ({}) {}: {}",
+            schema_name,
+            path.display(),
+            msgs
+        ));
+    }
+    Ok(())
+}
+
+fn validate_jsonl_against_schema(schema_name: &str, path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Err(anyhow!(
+            "required artifact missing for schema {}: {}",
+            schema_name,
+            path.display()
+        ));
+    }
+    let schema = compile_schema(schema_name)?;
+    let data = fs::read_to_string(path)?;
+    for (idx, line) in data.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(line).map_err(|e| {
+            anyhow!(
+                "invalid json line {} in {}: {}",
+                idx + 1,
+                path.display(),
+                e
+            )
+        })?;
+        match schema.validate(&value) {
+            Ok(_) => {}
+            Err(errors) => {
+                let msgs = errors.map(|e| e.to_string()).collect::<Vec<_>>().join("; ");
+                return Err(anyhow!(
+                    "schema validation failed ({}) {} line {}: {}",
+                    schema_name,
+                    path.display(),
+                    idx + 1,
+                    msgs
+                ));
+            }
+        };
+    }
+    Ok(())
+}
+
+fn verdict_from_outcome(outcome: &str) -> &'static str {
+    match outcome {
+        "success" => "pass",
+        "missing" => "missing",
+        "error" => "error",
+        _ => "fail",
+    }
+}
+
+fn outcome_from_verdict(verdict: &str) -> &'static str {
+    match verdict {
+        "pass" => "success",
+        "missing" => "missing",
+        "error" => "error",
+        _ => "failure",
+    }
+}
+
+fn build_benchmark_summary(run_id: &str, manifest: &Value, score_rows: &[Value]) -> Value {
+    let (adapter_id, name, version, split) = benchmark_identity_from_manifest(manifest);
+    let evaluator = manifest
+        .pointer("/evaluator")
+        .cloned()
+        .unwrap_or_else(|| json!({"name": "runner_passthrough", "mode": "custom"}));
+
+    let mut totals = BTreeMap::from([
+        ("pass".to_string(), 0usize),
+        ("fail".to_string(), 0usize),
+        ("missing".to_string(), 0usize),
+        ("error".to_string(), 0usize),
+    ]);
+    let mut by_variant: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
+
+    for row in score_rows {
+        let verdict = row
+            .pointer("/verdict")
+            .and_then(|v| v.as_str())
+            .unwrap_or("error")
+            .to_string();
+        *totals.entry(verdict).or_default() += 1;
+        let variant_id = row
+            .pointer("/ids/variant_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        by_variant.entry(variant_id).or_default().push(row);
+    }
+
+    let mut variants = Vec::new();
+    for (variant_id, rows) in by_variant {
+        let total = rows.len();
+        let pass = rows
+            .iter()
+            .filter(|r| r.pointer("/verdict").and_then(|v| v.as_str()) == Some("pass"))
+            .count();
+        let fail = rows
+            .iter()
+            .filter(|r| r.pointer("/verdict").and_then(|v| v.as_str()) == Some("fail"))
+            .count();
+        let missing = rows
+            .iter()
+            .filter(|r| r.pointer("/verdict").and_then(|v| v.as_str()) == Some("missing"))
+            .count();
+        let error = rows
+            .iter()
+            .filter(|r| r.pointer("/verdict").and_then(|v| v.as_str()) == Some("error"))
+            .count();
+        let pass_rate = if total > 0 {
+            pass as f64 / total as f64
+        } else {
+            0.0
+        };
+        let primary_metric_name = rows
+            .iter()
+            .find_map(|r| {
+                r.pointer("/primary_metric_name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| "resolved".to_string());
+        let mut pm_sum = 0.0f64;
+        let mut pm_count = 0usize;
+        for row in rows {
+            if let Some(v) = row
+                .pointer("/primary_metric_value")
+                .and_then(|v| v.as_f64())
+            {
+                pm_sum += v;
+                pm_count += 1;
+            }
+        }
+        let primary_metric_mean = if pm_count > 0 {
+            pm_sum / pm_count as f64
+        } else {
+            0.0
+        };
+        variants.push(json!({
+            "variant_id": variant_id,
+            "total": total,
+            "pass": pass,
+            "fail": fail,
+            "missing": missing,
+            "error": error,
+            "pass_rate": pass_rate,
+            "primary_metric_name": primary_metric_name,
+            "primary_metric_mean": primary_metric_mean
+        }));
+    }
+
+    json!({
+        "schema_version": "benchmark_summary_v1",
+        "created_at": Utc::now().to_rfc3339(),
+        "run_id": run_id,
+        "benchmark": {
+            "adapter_id": adapter_id,
+            "name": name,
+            "version": version,
+            "split": split
+        },
+        "evaluator": evaluator,
+        "totals": {
+            "trials": score_rows.len(),
+            "pass": totals.get("pass").copied().unwrap_or(0),
+            "fail": totals.get("fail").copied().unwrap_or(0),
+            "missing": totals.get("missing").copied().unwrap_or(0),
+            "error": totals.get("error").copied().unwrap_or(0)
+        },
+        "variants": variants
+    })
+}
+
+fn generate_passthrough_benchmark_records(
+    run_id: &str,
+    manifest: &Value,
+    trial_summaries: &[Value],
+    predictions_path: &Path,
+    scores_path: &Path,
+    summary_path: &Path,
+) -> Result<()> {
+    let (adapter_id, name, version, split) = benchmark_identity_from_manifest(manifest);
+    let evaluator = manifest
+        .pointer("/evaluator")
+        .cloned()
+        .unwrap_or_else(|| json!({"name": "runner_passthrough", "mode": "custom"}));
+
+    let mut prediction_rows = Vec::new();
+    let mut score_rows = Vec::new();
+    for summary in trial_summaries {
+        let ids = json!({
+            "run_id": summary.pointer("/run_id").and_then(|v| v.as_str()).unwrap_or(run_id),
+            "trial_id": summary.pointer("/trial_id").and_then(|v| v.as_str()).unwrap_or(""),
+            "variant_id": summary.pointer("/variant_id").and_then(|v| v.as_str()).unwrap_or(""),
+            "task_id": summary.pointer("/task_id").and_then(|v| v.as_str()).unwrap_or(""),
+            "repl_idx": summary.pointer("/repl_idx").and_then(|v| v.as_u64()).unwrap_or(0),
+        });
+        let outcome = summary
+            .pointer("/outcome")
+            .and_then(|v| v.as_str())
+            .unwrap_or("error");
+        let verdict = verdict_from_outcome(outcome);
+        let primary_metric_name = summary
+            .pointer("/primary_metric_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("resolved")
+            .to_string();
+        let primary_metric_value = summary
+            .pointer("/primary_metric_value")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(if verdict == "pass" { 1.0 } else { 0.0 });
+
+        prediction_rows.push(json!({
+            "schema_version": "benchmark_prediction_record_v1",
+            "ts": Utc::now().to_rfc3339(),
+            "ids": ids,
+            "benchmark": {
+                "adapter_id": adapter_id.clone(),
+                "name": name.clone(),
+                "version": version.clone(),
+                "split": split.clone()
+            },
+            "prediction": {
+                "kind": "json",
+                "value": {
+                    "outcome": outcome,
+                    "metrics": summary.pointer("/metrics").cloned().unwrap_or(json!({}))
+                }
+            },
+            "metrics": summary.pointer("/metrics").cloned().unwrap_or(json!({}))
+        }));
+
+        score_rows.push(json!({
+            "schema_version": "benchmark_score_record_v1",
+            "ts": Utc::now().to_rfc3339(),
+            "ids": ids,
+            "benchmark": {
+                "adapter_id": adapter_id.clone(),
+                "name": name.clone(),
+                "version": version.clone(),
+                "split": split.clone()
+            },
+            "verdict": verdict,
+            "primary_metric_name": primary_metric_name,
+            "primary_metric_value": primary_metric_value,
+            "metrics": summary.pointer("/metrics").cloned().unwrap_or(json!({})),
+            "evaluator": evaluator.clone()
+        }));
+    }
+
+    write_jsonl_records(predictions_path, &prediction_rows)?;
+    write_jsonl_records(scores_path, &score_rows)?;
+    let summary = build_benchmark_summary(run_id, manifest, &score_rows);
+    atomic_write_json_pretty(summary_path, &summary)?;
+    Ok(())
+}
+
+fn process_benchmark_outputs(
+    project_root: &Path,
+    run_dir: &Path,
+    run_id: &str,
+    trial_summaries: &[Value],
+    benchmark_config: &BenchmarkConfig,
+    evidence_records_path: &Path,
+    task_chain_states_path: &Path,
+) -> Result<BenchmarkArtifactsPaths> {
+    let benchmark_dir = run_dir.join("benchmark");
+    ensure_dir(&benchmark_dir)?;
+    let manifest_path = benchmark_dir.join("adapter_manifest.json");
+    let predictions_path = benchmark_dir.join("predictions.jsonl");
+    let scores_path = benchmark_dir.join("scores.jsonl");
+    let summary_path = benchmark_dir.join("summary.json");
+
+    let manifest = normalize_benchmark_manifest(
+        run_id,
+        benchmark_config
+            .adapter
+            .as_ref()
+            .and_then(|a| a.manifest.clone()),
+        &benchmark_config.policy,
+    );
+    atomic_write_json_pretty(&manifest_path, &manifest)?;
+
+    if let Some(adapter) = benchmark_config.adapter.as_ref() {
+        if adapter.command.is_empty() {
+            return Err(anyhow!("benchmark adapter command cannot be empty"));
+        }
+        let mut cmd = Command::new(&adapter.command[0]);
+        cmd.args(&adapter.command[1..]);
+        cmd.current_dir(project_root);
+        cmd.env("AGENTLAB_RUN_ID", run_id);
+        cmd.env("AGENTLAB_RUN_DIR", run_dir);
+        cmd.env("AGENTLAB_EVIDENCE_RECORDS_PATH", evidence_records_path);
+        cmd.env("AGENTLAB_TASK_CHAIN_STATES_PATH", task_chain_states_path);
+        cmd.env("AGENTLAB_BENCHMARK_DIR", &benchmark_dir);
+        cmd.env("AGENTLAB_ADAPTER_MANIFEST_PATH", &manifest_path);
+        cmd.env("AGENTLAB_PREDICTIONS_PATH", &predictions_path);
+        cmd.env("AGENTLAB_SCORES_PATH", &scores_path);
+        cmd.env("AGENTLAB_BENCHMARK_SUMMARY_PATH", &summary_path);
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::inherit());
+        cmd.stderr(Stdio::inherit());
+        let status = cmd.status()?;
+        if !status.success() {
+            return Err(anyhow!(
+                "benchmark adapter command failed with status {}",
+                status
+            ));
+        }
+        if !predictions_path.exists() {
+            return Err(anyhow!(
+                "benchmark adapter did not produce predictions.jsonl"
+            ));
+        }
+        if !scores_path.exists() {
+            return Err(anyhow!("benchmark adapter did not produce scores.jsonl"));
+        }
+        if !summary_path.exists() {
+            let scores = read_jsonl_records(&scores_path)?;
+            let summary = build_benchmark_summary(run_id, &manifest, &scores);
+            atomic_write_json_pretty(&summary_path, &summary)?;
+        }
+    } else {
+        generate_passthrough_benchmark_records(
+            run_id,
+            &manifest,
+            trial_summaries,
+            &predictions_path,
+            &scores_path,
+            &summary_path,
+        )?;
+    }
+
+    validate_json_file_against_schema("benchmark_adapter_manifest_v1.jsonschema", &manifest_path)?;
+    validate_jsonl_against_schema("benchmark_prediction_record_v1.jsonschema", &predictions_path)?;
+    validate_jsonl_against_schema("benchmark_score_record_v1.jsonschema", &scores_path)?;
+    validate_json_file_against_schema("benchmark_summary_v1.jsonschema", &summary_path)?;
+
+    Ok(BenchmarkArtifactsPaths { scores_path })
+}
+
+fn apply_score_records_to_trial_summaries(
+    trial_summaries: &mut [Value],
+    scores_path: &Path,
+) -> Result<()> {
+    if !scores_path.exists() {
+        return Ok(());
+    }
+    let scores = read_jsonl_records(scores_path)?;
+    if scores.is_empty() {
+        return Ok(());
+    }
+    let mut by_trial: BTreeMap<String, &Value> = BTreeMap::new();
+    for score in &scores {
+        if let Some(trial_id) = score
+            .pointer("/ids/trial_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+        {
+            by_trial.insert(trial_id, score);
+        }
+    }
+
+    for summary in trial_summaries.iter_mut() {
+        let trial_id = summary
+            .pointer("/trial_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let Some(score) = by_trial.get(trial_id) else {
+            continue;
+        };
+        let verdict = score
+            .pointer("/verdict")
+            .and_then(|v| v.as_str())
+            .unwrap_or("error");
+        let mapped_outcome = outcome_from_verdict(verdict);
+        if let Some(obj) = summary.as_object_mut() {
+            obj.insert("outcome".to_string(), json!(mapped_outcome));
+            obj.insert("success".to_string(), json!(verdict == "pass"));
+            if let Some(name) = score.pointer("/primary_metric_name").and_then(|v| v.as_str()) {
+                obj.insert("primary_metric_name".to_string(), json!(name));
+            }
+            if let Some(value) = score.pointer("/primary_metric_value") {
+                obj.insert("primary_metric_value".to_string(), value.clone());
+            }
+            let mut metrics = obj
+                .get("metrics")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            if let Some(metrics_obj) = metrics.as_object_mut() {
+                metrics_obj.insert("benchmark_verdict".to_string(), json!(verdict));
+            }
+            obj.insert("metrics".to_string(), metrics);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct TrialSlot {
+    variant_idx: usize,
+    task_idx: usize,
+    repl_idx: usize,
+}
+
+fn build_trial_schedule(
+    variant_count: usize,
+    task_count: usize,
+    replications: usize,
+    policy: SchedulingPolicy,
+    random_seed: u64,
+) -> Vec<TrialSlot> {
+    let mut slots = Vec::with_capacity(variant_count * task_count * replications);
+
+    match policy {
+        SchedulingPolicy::VariantSequential => {
+            for v in 0..variant_count {
+                for t in 0..task_count {
+                    for r in 0..replications {
+                        slots.push(TrialSlot {
+                            variant_idx: v,
+                            task_idx: t,
+                            repl_idx: r,
+                        });
+                    }
+                }
+            }
+        }
+        SchedulingPolicy::PairedInterleaved => {
+            for t in 0..task_count {
+                for v in 0..variant_count {
+                    for r in 0..replications {
+                        slots.push(TrialSlot {
+                            variant_idx: v,
+                            task_idx: t,
+                            repl_idx: r,
+                        });
+                    }
+                }
+            }
+        }
+        SchedulingPolicy::Randomized => {
+            // Build variant_sequential order then shuffle deterministically
+            for v in 0..variant_count {
+                for t in 0..task_count {
+                    for r in 0..replications {
+                        slots.push(TrialSlot {
+                            variant_idx: v,
+                            task_idx: t,
+                            repl_idx: r,
+                        });
+                    }
+                }
+            }
+            // Deterministic Fisher-Yates using LCG seeded by random_seed
+            let mut rng_state: u64 = random_seed;
+            for i in (1..slots.len()).rev() {
+                // LCG: state = state * 6364136223846793005 + 1442695040888963407
+                rng_state = rng_state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let j = (rng_state >> 33) as usize % (i + 1);
+                slots.swap(i, j);
+            }
+        }
+    }
+
+    slots
+}
+
+fn should_retry_outcome(outcome: &str, exit_status: &str, retry_on: &[String]) -> bool {
+    if retry_on.is_empty() {
+        // When retry_on is unspecified, retry on any non-success
+        return outcome == "error" || exit_status != "0";
+    }
+    for trigger in retry_on {
+        match trigger.as_str() {
+            "error" if outcome == "error" => return true,
+            "failure" if exit_status != "0" => return true,
+            "timeout" if outcome == "timeout" => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 struct Variant {
@@ -2199,6 +3526,388 @@ fn count_tasks(path: &Path, json_value: &Value) -> Result<usize> {
     }
     Ok(count)
 }
+
+const TASK_BOUNDARY_V1_SCHEMA_VERSION: &str = "task_boundary_v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkspaceFileSpec {
+    path: String,
+    content: String,
+    #[serde(default)]
+    encoding: Option<String>,
+    #[serde(default)]
+    executable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MountReferenceSpec {
+    dataset_pack_ref: String,
+    mount_path: String,
+    #[serde(default)]
+    read_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct TaskBoundaryLimits {
+    #[serde(default)]
+    max_steps: Option<u64>,
+    #[serde(default)]
+    max_total_tokens: Option<u64>,
+    #[serde(default)]
+    max_tool_calls: Option<u64>,
+    #[serde(default)]
+    trial_seconds: Option<u64>,
+}
+
+impl TaskBoundaryLimits {
+    fn is_empty(&self) -> bool {
+        self.max_steps.is_none()
+            && self.max_total_tokens.is_none()
+            && self.max_tool_calls.is_none()
+            && self.trial_seconds.is_none()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TaskBoundaryMaterialization {
+    task_payload: Value,
+    workspace_files: Vec<WorkspaceFileSpec>,
+    mount_references: Vec<MountReferenceSpec>,
+    limits: TaskBoundaryLimits,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedMountReference {
+    host_path: PathBuf,
+    mount_path: String,
+}
+
+fn default_task_boundary(task_payload: Value) -> TaskBoundaryMaterialization {
+    TaskBoundaryMaterialization {
+        task_payload,
+        workspace_files: Vec::new(),
+        mount_references: Vec::new(),
+        limits: TaskBoundaryLimits::default(),
+    }
+}
+
+fn parse_task_boundary_from_dataset_task(task: &Value) -> Result<TaskBoundaryMaterialization> {
+    if task.get("schema_version").and_then(|v| v.as_str()) != Some(TASK_BOUNDARY_V1_SCHEMA_VERSION)
+    {
+        return Ok(default_task_boundary(task.clone()));
+    }
+    let obj = task
+        .as_object()
+        .ok_or_else(|| anyhow!("task boundary must be an object"))?;
+
+    let allowed = [
+        "schema_version",
+        "task",
+        "workspace_files",
+        "mount_references",
+        "limits",
+    ];
+    for key in obj.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(anyhow!(
+                "task boundary contains unsupported key '{}'; expected task + workspace_files + mount_references + limits",
+                key
+            ));
+        }
+    }
+
+    let task_payload = obj
+        .get("task")
+        .cloned()
+        .ok_or_else(|| anyhow!("task boundary missing field: task"))?;
+    if !task_payload.is_object() {
+        return Err(anyhow!("task boundary field 'task' must be an object"));
+    }
+
+    Ok(TaskBoundaryMaterialization {
+        task_payload,
+        workspace_files: parse_workspace_files(obj.get("workspace_files"))?,
+        mount_references: parse_mount_references(obj.get("mount_references"))?,
+        limits: parse_task_limits(obj.get("limits"))?,
+    })
+}
+
+fn parse_task_boundary_from_trial_input(input: &Value) -> Result<TaskBoundaryMaterialization> {
+    // Backward compatibility: older trial_input fixtures may not include /task.
+    let task_payload = input
+        .pointer("/task")
+        .cloned()
+        .or_else(|| input.pointer("/dataset/task").cloned())
+        .unwrap_or_else(|| json!({}));
+    if !task_payload.is_object() {
+        return Err(anyhow!("trial_input task payload must be an object"));
+    }
+
+    if let Some(ext) = input.pointer("/ext/task_boundary_v1") {
+        parse_task_boundary_ext(ext, task_payload)
+    } else if task_payload.get("schema_version").and_then(|v| v.as_str())
+        == Some(TASK_BOUNDARY_V1_SCHEMA_VERSION)
+    {
+        parse_task_boundary_from_dataset_task(&task_payload)
+    } else {
+        Ok(default_task_boundary(task_payload))
+    }
+}
+
+fn parse_task_boundary_ext(
+    ext: &Value,
+    task_payload: Value,
+) -> Result<TaskBoundaryMaterialization> {
+    let obj = ext
+        .as_object()
+        .ok_or_else(|| anyhow!("trial_input /ext/task_boundary_v1 must be an object"))?;
+    if let Some(schema_version) = obj.get("schema_version") {
+        if schema_version.as_str() != Some(TASK_BOUNDARY_V1_SCHEMA_VERSION) {
+            return Err(anyhow!(
+                "unsupported task boundary schema version in /ext/task_boundary_v1"
+            ));
+        }
+    }
+
+    Ok(TaskBoundaryMaterialization {
+        task_payload,
+        workspace_files: parse_workspace_files(obj.get("workspace_files"))?,
+        mount_references: parse_mount_references(obj.get("mount_references"))?,
+        limits: parse_task_limits(obj.get("limits"))?,
+    })
+}
+
+fn parse_workspace_files(value: Option<&Value>) -> Result<Vec<WorkspaceFileSpec>> {
+    let Some(raw) = value else {
+        return Ok(Vec::new());
+    };
+    let arr = raw
+        .as_array()
+        .ok_or_else(|| anyhow!("task boundary workspace_files must be an array"))?;
+
+    let mut files = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        let file: WorkspaceFileSpec = serde_json::from_value(item.clone())
+            .map_err(|e| anyhow!("invalid workspace_files[{}]: {}", idx, e))?;
+        let _ = validate_workspace_relative_path(&file.path).map_err(|e| {
+            anyhow!(
+                "invalid workspace_files[{}].path '{}': {}",
+                idx,
+                file.path,
+                e
+            )
+        })?;
+        if let Some(encoding) = file.encoding.as_deref() {
+            if encoding != "utf8" && encoding != "base64" {
+                return Err(anyhow!(
+                    "workspace_files[{}].encoding must be 'utf8' or 'base64'",
+                    idx
+                ));
+            }
+        }
+        files.push(file);
+    }
+    Ok(files)
+}
+
+fn parse_mount_references(value: Option<&Value>) -> Result<Vec<MountReferenceSpec>> {
+    let Some(raw) = value else {
+        return Ok(Vec::new());
+    };
+    let arr = raw
+        .as_array()
+        .ok_or_else(|| anyhow!("task boundary mount_references must be an array"))?;
+
+    let mut mounts = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        let mount: MountReferenceSpec = serde_json::from_value(item.clone())
+            .map_err(|e| anyhow!("invalid mount_references[{}]: {}", idx, e))?;
+        if !mount.read_only {
+            return Err(anyhow!("mount_references[{}].read_only must be true", idx));
+        }
+        validate_container_workspace_path(&mount.mount_path).map_err(|e| {
+            anyhow!(
+                "invalid mount_references[{}].mount_path '{}': {}",
+                idx,
+                mount.mount_path,
+                e
+            )
+        })?;
+        let _ = parse_dataset_pack_ref_digest(&mount.dataset_pack_ref).map_err(|e| {
+            anyhow!(
+                "invalid mount_references[{}].dataset_pack_ref '{}': {}",
+                idx,
+                mount.dataset_pack_ref,
+                e
+            )
+        })?;
+        mounts.push(mount);
+    }
+    Ok(mounts)
+}
+
+fn parse_task_limits(value: Option<&Value>) -> Result<TaskBoundaryLimits> {
+    let Some(raw) = value else {
+        return Ok(TaskBoundaryLimits::default());
+    };
+    let limits: TaskBoundaryLimits =
+        serde_json::from_value(raw.clone()).map_err(|e| anyhow!("invalid limits: {}", e))?;
+    validate_limit_positive("max_steps", limits.max_steps)?;
+    validate_limit_positive("max_total_tokens", limits.max_total_tokens)?;
+    validate_limit_positive("max_tool_calls", limits.max_tool_calls)?;
+    validate_limit_positive("trial_seconds", limits.trial_seconds)?;
+    Ok(limits)
+}
+
+fn validate_limit_positive(name: &str, value: Option<u64>) -> Result<()> {
+    if value == Some(0) {
+        return Err(anyhow!("{} must be > 0 when provided", name));
+    }
+    Ok(())
+}
+
+fn validate_workspace_relative_path(path: &str) -> Result<PathBuf> {
+    if path.trim().is_empty() {
+        return Err(anyhow!("path cannot be empty"));
+    }
+    let p = Path::new(path);
+    if p.is_absolute() {
+        return Err(anyhow!("path must be relative to /workspace"));
+    }
+    let mut normalized = PathBuf::new();
+    for component in p.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(seg) => normalized.push(seg),
+            Component::ParentDir => {
+                return Err(anyhow!("path cannot contain '..'"));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(anyhow!("path cannot be absolute"));
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err(anyhow!("path cannot resolve to empty"));
+    }
+    Ok(normalized)
+}
+
+fn validate_container_workspace_path(path: &str) -> Result<()> {
+    if !(path == "/workspace" || path.starts_with("/workspace/")) {
+        return Err(anyhow!("mount_path must be under /workspace"));
+    }
+    let p = Path::new(path);
+    if !p.is_absolute() {
+        return Err(anyhow!("mount_path must be absolute"));
+    }
+    for component in p.components() {
+        if matches!(component, Component::ParentDir) {
+            return Err(anyhow!("mount_path cannot contain '..'"));
+        }
+    }
+    Ok(())
+}
+
+fn parse_dataset_pack_ref_digest(dataset_pack_ref: &str) -> Result<String> {
+    let digest = dataset_pack_ref
+        .strip_prefix("sha256:")
+        .ok_or_else(|| anyhow!("dataset_pack_ref must start with 'sha256:'"))?;
+    if digest.len() != 64 || !digest.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(anyhow!("dataset_pack_ref digest must be 64 hex characters"));
+    }
+    Ok(digest.to_ascii_lowercase())
+}
+
+fn resolve_dataset_pack_host_path(project_root: &Path, dataset_pack_ref: &str) -> Result<PathBuf> {
+    let digest = parse_dataset_pack_ref_digest(dataset_pack_ref)?;
+    let path = project_root
+        .join(".lab")
+        .join("dataset_packs")
+        .join("sha256")
+        .join(digest);
+    if !path.exists() {
+        return Err(anyhow!("dataset pack not found: {}", path.display()));
+    }
+    Ok(path)
+}
+
+fn resolve_task_mounts(
+    project_root: &Path,
+    mount_references: &[MountReferenceSpec],
+    container_mode: bool,
+) -> Result<Vec<ResolvedMountReference>> {
+    if mount_references.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !container_mode {
+        return Err(anyhow!("task mount_references require container executor"));
+    }
+    let mut mounts = Vec::with_capacity(mount_references.len());
+    for mount in mount_references {
+        let host_path = resolve_dataset_pack_host_path(project_root, &mount.dataset_pack_ref)?;
+        mounts.push(ResolvedMountReference {
+            host_path,
+            mount_path: mount.mount_path.clone(),
+        });
+    }
+    Ok(mounts)
+}
+
+fn materialize_workspace_files(
+    paths: &TrialPaths,
+    workspace_files: &[WorkspaceFileSpec],
+) -> Result<()> {
+    for file in workspace_files {
+        let rel = validate_workspace_relative_path(&file.path)?;
+        let host_path = paths.workspace.join(rel);
+        let bytes = match file.encoding.as_deref() {
+            None | Some("utf8") => file.content.as_bytes().to_vec(),
+            Some("base64") => BASE64_STANDARD
+                .decode(file.content.as_bytes())
+                .map_err(|e| {
+                    anyhow!(
+                        "failed to decode base64 workspace file '{}': {}",
+                        file.path,
+                        e
+                    )
+                })?,
+            Some(other) => {
+                return Err(anyhow!(
+                    "unsupported workspace file encoding '{}' for '{}'",
+                    other,
+                    file.path
+                ));
+            }
+        };
+        atomic_write_bytes(&host_path, &bytes)?;
+        #[cfg(unix)]
+        if file.executable {
+            let metadata = fs::metadata(&host_path)?;
+            let mut perms = metadata.permissions();
+            perms.set_mode(perms.mode() | 0o111);
+            fs::set_permissions(&host_path, perms)?;
+        }
+    }
+    Ok(())
+}
+
+fn task_boundary_ext_value(task_boundary: &TaskBoundaryMaterialization) -> Option<Value> {
+    if task_boundary.workspace_files.is_empty()
+        && task_boundary.mount_references.is_empty()
+        && task_boundary.limits.is_empty()
+    {
+        return None;
+    }
+
+    Some(json!({
+        "schema_version": TASK_BOUNDARY_V1_SCHEMA_VERSION,
+        "workspace_files": task_boundary.workspace_files,
+        "mount_references": task_boundary.mount_references,
+        "limits": task_boundary.limits,
+    }))
+}
+
 #[derive(Clone)]
 struct HarnessConfig {
     command_raw: Vec<String>,
@@ -2333,12 +4042,13 @@ impl TrialPaths {
 
 fn build_trial_input(
     json_value: &Value,
+    run_id: &str,
     workload_type: &str,
     trial_id: &str,
     variant: &Variant,
     task_idx: usize,
     repl: usize,
-    task: &Value,
+    task_boundary: &TaskBoundaryMaterialization,
     paths: &TrialPaths,
     container_mode: bool,
 ) -> Value {
@@ -2372,16 +4082,57 @@ fn build_trial_input(
             .to_string_lossy()
             .to_string()
     };
-    json!({
+    let mut runtime = serde_json::Map::new();
+    runtime.insert("paths".to_string(), runtime_paths);
+    runtime.insert(
+        "network".to_string(),
+        json!({
+            "mode_requested": json_value.pointer("/runtime/network/mode").and_then(|v| v.as_str()).unwrap_or("none"),
+            "allowed_hosts": json_value.pointer("/runtime/network/allowed_hosts").cloned().unwrap_or(json!([])),
+        }),
+    );
+    runtime.insert(
+        "control_plane".to_string(),
+        json!({
+            "mode": json_value.pointer("/runtime/harness/control_plane/mode").and_then(|v| v.as_str()).unwrap_or("file"),
+            "path": control_path,
+        }),
+    );
+    if task_boundary.limits.max_steps.is_some()
+        || task_boundary.limits.max_total_tokens.is_some()
+        || task_boundary.limits.max_tool_calls.is_some()
+    {
+        let mut budgets = serde_json::Map::new();
+        if let Some(max_steps) = task_boundary.limits.max_steps {
+            budgets.insert("max_steps".to_string(), json!(max_steps));
+        }
+        if let Some(max_total_tokens) = task_boundary.limits.max_total_tokens {
+            budgets.insert("max_total_tokens".to_string(), json!(max_total_tokens));
+        }
+        if let Some(max_tool_calls) = task_boundary.limits.max_tool_calls {
+            budgets.insert("max_tool_calls".to_string(), json!(max_tool_calls));
+        }
+        runtime.insert("budgets".to_string(), Value::Object(budgets));
+    }
+    if task_boundary.limits.trial_seconds.is_some() {
+        runtime.insert(
+            "timeouts".to_string(),
+            json!({
+                "trial_seconds": task_boundary.limits.trial_seconds,
+            }),
+        );
+    }
+
+    let mut input = json!({
         "schema_version": "trial_input_v1",
         "ids": {
-            "run_id": json_value.pointer("/experiment/id").and_then(|v| v.as_str()).unwrap_or("run"),
+            "run_id": run_id,
             "trial_id": trial_id,
             "variant_id": variant.id,
-            "task_id": task.get("id").and_then(|v| v.as_str()).unwrap_or(&format!("task_{}", task_idx)),
+            "task_id": task_boundary.task_payload.get("id").and_then(|v| v.as_str()).unwrap_or(&format!("task_{}", task_idx)),
             "repl_idx": repl
         },
-        "task": task,
+        "task": task_boundary.task_payload.clone(),
         "workload": {
             "type": workload_type
         },
@@ -2390,18 +4141,188 @@ fn build_trial_input(
             "sanitization_profile": json_value.pointer("/design/sanitization_profile").and_then(|v| v.as_str()).unwrap_or("hermetic_functional_v2"),
             "integration_level": json_value.pointer("/runtime/harness/integration_level").and_then(|v| v.as_str()).unwrap_or("cli_basic"),
         },
-        "runtime": {
-            "paths": runtime_paths,
-            "network": {
-                "mode_requested": json_value.pointer("/runtime/network/mode").and_then(|v| v.as_str()).unwrap_or("none"),
-                "allowed_hosts": json_value.pointer("/runtime/network/allowed_hosts").cloned().unwrap_or(json!([])),
-            },
-            "control_plane": {
-                "mode": json_value.pointer("/runtime/harness/control_plane/mode").and_then(|v| v.as_str()).unwrap_or("file"),
-                "path": control_path,
+        "runtime": Value::Object(runtime),
+    });
+    if let Some(task_boundary_ext) = task_boundary_ext_value(task_boundary) {
+        if let Some(obj) = input.as_object_mut() {
+            obj.insert(
+                "ext".to_string(),
+                json!({ "task_boundary_v1": task_boundary_ext }),
+            );
+        }
+    }
+    input
+}
+
+fn sanitize_for_fs(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "chain".to_string()
+    } else {
+        out
+    }
+}
+
+fn append_jsonl(path: &Path, value: &Value) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    serde_json::to_writer(&mut file, value)?;
+    writeln!(&mut file)?;
+    Ok(())
+}
+
+fn collect_workspace_snapshot_manifest(workspace: &Path) -> Result<Value> {
+    let mut files: Vec<(String, String, u64)> = Vec::new();
+    if workspace.exists() {
+        let walker = walkdir::WalkDir::new(workspace).into_iter();
+        for entry in walker {
+            let entry = entry?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let rel = entry
+                .path()
+                .strip_prefix(workspace)
+                .unwrap_or(entry.path())
+                .to_string_lossy()
+                .to_string();
+            let digest = sha256_file(entry.path())?;
+            let size = entry.metadata()?.len();
+            files.push((rel, digest, size));
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let total_bytes = files.iter().map(|(_, _, sz)| *sz).sum::<u64>();
+    let rows = files
+        .into_iter()
+        .map(|(path, digest, size_bytes)| {
+            json!({
+                "path": path,
+                "digest": digest,
+                "size_bytes": size_bytes
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "schema_version": "workspace_snapshot_v1",
+        "captured_at": Utc::now().to_rfc3339(),
+        "file_count": rows.len(),
+        "total_bytes": total_bytes,
+        "files": rows
+    }))
+}
+
+fn snapshot_file_map(snapshot_manifest: &Value) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    if let Some(arr) = snapshot_manifest.get("files").and_then(|v| v.as_array()) {
+        for row in arr {
+            let path = row.get("path").and_then(|v| v.as_str());
+            let digest = row.get("digest").and_then(|v| v.as_str());
+            if let (Some(path), Some(digest)) = (path, digest) {
+                map.insert(path.to_string(), digest.to_string());
             }
         }
+    }
+    map
+}
+
+fn diff_workspace_snapshots(prev: &Value, post: &Value) -> Value {
+    let prev_map = snapshot_file_map(prev);
+    let post_map = snapshot_file_map(post);
+
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    let mut modified = Vec::new();
+
+    for (path, digest) in post_map.iter() {
+        match prev_map.get(path) {
+            None => added.push(path.clone()),
+            Some(prev_digest) if prev_digest != digest => modified.push(path.clone()),
+            _ => {}
+        }
+    }
+    for path in prev_map.keys() {
+        if !post_map.contains_key(path) {
+            removed.push(path.clone());
+        }
+    }
+
+    json!({
+        "schema_version": "workspace_diff_v1",
+        "captured_at": Utc::now().to_rfc3339(),
+        "added": added,
+        "removed": removed,
+        "modified": modified,
+        "summary": {
+            "added_files": added.len(),
+            "removed_files": removed.len(),
+            "modified_files": modified.len()
+        }
     })
+}
+
+fn derive_patch_from_diff(diff: &Value) -> Value {
+    json!({
+        "schema_version": "workspace_patch_v1",
+        "format": "file_digest_delta",
+        "generated_at": Utc::now().to_rfc3339(),
+        "added": diff.get("added").cloned().unwrap_or(json!([])),
+        "removed": diff.get("removed").cloned().unwrap_or(json!([])),
+        "modified": diff.get("modified").cloned().unwrap_or(json!([])),
+    })
+}
+
+fn restore_workspace_from_snapshot(snapshot_dir: &Path, workspace_dir: &Path) -> Result<()> {
+    if workspace_dir.exists() {
+        fs::remove_dir_all(workspace_dir)?;
+    }
+    ensure_dir(workspace_dir)?;
+    copy_dir_filtered(snapshot_dir, workspace_dir, &[])?;
+    Ok(())
+}
+
+fn resolve_chain_label(
+    task_payload: &Value,
+    task_id: &str,
+    state_policy: StatePolicy,
+) -> String {
+    let explicit = task_payload
+        .get("chain_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    if let Some(label) = explicit {
+        return label;
+    }
+    match state_policy {
+        StatePolicy::PersistPerTask => task_id.to_string(),
+        StatePolicy::Accumulate => "global".to_string(),
+        StatePolicy::IsolatePerTrial => task_id.to_string(),
+    }
+}
+
+fn rel_to_run_dir(path: &Path, run_dir: &Path) -> String {
+    path.strip_prefix(run_dir)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string()
+}
+
+struct ProcessRunResult {
+    status: String,
+    stdout: String,
+    stderr: String,
 }
 
 fn run_harness_local(
@@ -2411,13 +4332,14 @@ fn run_harness_local(
     output_path: &Path,
     control_path: &str,
     command: &[String],
-) -> Result<String> {
+) -> Result<ProcessRunResult> {
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..]);
     cmd.current_dir(&paths.workspace);
     cmd.env("AGENTLAB_TRIAL_INPUT", &input_path);
     cmd.env("AGENTLAB_TRIAL_OUTPUT", &output_path);
     cmd.env("AGENTLAB_CONTROL_PATH", control_path);
+    cmd.env("AGENTLAB_HARNESS_ROOT", &paths.exp_dir);
     if harness.tracing_mode.as_deref() == Some("otlp") {
         cmd.env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4318");
     }
@@ -2428,13 +4350,14 @@ fn run_harness_container(
     json_value: &Value,
     harness: &HarnessConfig,
     paths: &TrialPaths,
+    dynamic_mounts: &[ResolvedMountReference],
     input_path: &Path,
     output_path: &Path,
     control_path: &str,
     command: &[String],
     network_mode: &str,
     setup_command: Option<&str>,
-) -> Result<String> {
+) -> Result<ProcessRunResult> {
     let image = json_value
         .pointer("/runtime/sandbox/image")
         .and_then(|v| v.as_str())
@@ -2497,9 +4420,17 @@ fn run_harness_container(
     }
 
     cmd.args(["-v", &format!("{}:/workspace", paths.workspace.display())]);
+    // Keep harness code/dependencies isolated from mutable task state.
+    cmd.args(["-v", &format!("{}:/harness:ro", paths.exp_dir.display())]);
     cmd.args(["-v", &format!("{}:/state", paths.state.display())]);
     cmd.args(["-v", &format!("{}:/dataset:ro", paths.dataset.display())]);
     cmd.args(["-v", &format!("{}:/out", paths.out.display())]);
+    for mount in dynamic_mounts {
+        cmd.args([
+            "-v",
+            &format!("{}:{}:ro", mount.host_path.display(), mount.mount_path),
+        ]);
+    }
     cmd.args(["--tmpfs", "/tmp:rw"]);
     cmd.args(["-w", "/workspace"]);
 
@@ -2509,6 +4440,7 @@ fn run_harness_container(
         .arg(format!("AGENTLAB_TRIAL_OUTPUT={}", harness.output_path));
     cmd.arg("-e")
         .arg(format!("AGENTLAB_CONTROL_PATH={}", control_path));
+    cmd.arg("-e").arg("AGENTLAB_HARNESS_ROOT=/harness");
 
     if harness.tracing_mode.as_deref() == Some("otlp") {
         cmd.arg("-e")
@@ -2556,11 +4488,11 @@ fn resolve_command_container(command: &[String], exp_dir: &Path) -> Vec<String> 
         let p = Path::new(part);
         if p.is_relative() && command_part_looks_like_path(part) {
             let rel = p.to_string_lossy().trim_start_matches("./").to_string();
-            resolved.push(format!("/workspace/{}", rel));
+            resolved.push(format!("/harness/{}", rel));
         } else if p.is_absolute() && p.starts_with(exp_dir) {
             if let Ok(rel) = p.strip_prefix(exp_dir) {
                 let rel = rel.to_string_lossy().trim_start_matches('/').to_string();
-                resolved.push(format!("/workspace/{}", rel));
+                resolved.push(format!("/harness/{}", rel));
             } else {
                 resolved.push(part.clone());
             }
@@ -2645,7 +4577,7 @@ fn run_process_with_trial_io(
     mut cmd: Command,
     input_path: &Path,
     output_path: &Path,
-) -> Result<String> {
+) -> Result<ProcessRunResult> {
     let input_bytes = fs::read(input_path).unwrap_or_default();
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
@@ -2701,11 +4633,15 @@ fn run_process_with_trial_io(
         atomic_write_bytes(output_path, &fallback_bytes)?;
     }
 
-    Ok(output
-        .status
-        .code()
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| "signal".to_string()))
+    Ok(ProcessRunResult {
+        status: output
+            .status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signal".to_string()),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
 }
 
 fn shell_join(parts: &[String]) -> String {
@@ -2792,6 +4728,7 @@ fn write_control_action(
 fn resolve_event_path(events_path: &str, paths: &TrialPaths, _container_mode: bool) -> PathBuf {
     if events_path.starts_with("/out")
         || events_path.starts_with("/state")
+        || events_path.starts_with("/harness")
         || events_path.starts_with("/workspace")
         || events_path.starts_with("/dataset")
         || events_path.starts_with("/tmp")
@@ -2869,6 +4806,7 @@ fn write_state_inventory(
     let mounts = if container_mode {
         vec![
             json!({"name": "workspace", "path": "/workspace", "writable": true}),
+            json!({"name": "harness", "path": "/harness", "writable": false}),
             json!({"name": "state", "path": "/state", "writable": true}),
             json!({"name": "dataset", "path": "/dataset", "writable": false}),
             json!({"name": "out", "path": "/out", "writable": true}),
@@ -2955,6 +4893,8 @@ fn map_container_path_to_host(path: &str, paths: &TrialPaths) -> PathBuf {
         paths.state.join(rest.trim_start_matches('/'))
     } else if let Some(rest) = path.strip_prefix("/out") {
         paths.out.join(rest.trim_start_matches('/'))
+    } else if let Some(rest) = path.strip_prefix("/harness") {
+        paths.exp_dir.join(rest.trim_start_matches('/'))
     } else if let Some(rest) = path.strip_prefix("/workspace") {
         paths.workspace.join(rest.trim_start_matches('/'))
     } else if let Some(rest) = path.strip_prefix("/dataset") {
@@ -3913,5 +5853,511 @@ mod tests {
             "should not report workload_type: {}",
             msg
         );
+    }
+
+    #[test]
+    fn parse_task_boundary_extracts_runtime_fields() {
+        let task = json!({
+            "schema_version": "task_boundary_v1",
+            "task": {
+                "id": "task_1",
+                "prompt": "solve this"
+            },
+            "workspace_files": [
+                { "path": "notes/input.txt", "content": "hello" }
+            ],
+            "mount_references": [
+                {
+                    "dataset_pack_ref": format!("sha256:{}", "a".repeat(64)),
+                    "mount_path": "/workspace/dataset_pack",
+                    "read_only": true
+                }
+            ],
+            "limits": {
+                "max_steps": 8,
+                "max_total_tokens": 2048,
+                "max_tool_calls": 4,
+                "trial_seconds": 120
+            }
+        });
+
+        let parsed = parse_task_boundary_from_dataset_task(&task).expect("parse boundary");
+        assert_eq!(
+            parsed
+                .task_payload
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "task_1"
+        );
+        assert_eq!(parsed.workspace_files.len(), 1);
+        assert_eq!(parsed.mount_references.len(), 1);
+        assert_eq!(parsed.limits.max_steps, Some(8));
+        assert_eq!(parsed.limits.max_total_tokens, Some(2048));
+        assert_eq!(parsed.limits.max_tool_calls, Some(4));
+        assert_eq!(parsed.limits.trial_seconds, Some(120));
+    }
+
+    #[test]
+    fn parse_task_boundary_rejects_unsupported_keys() {
+        let task = json!({
+            "schema_version": "task_boundary_v1",
+            "task": { "id": "task_1" },
+            "workspace_files": [],
+            "mount_references": [],
+            "limits": {},
+            "benchmark_kind": "custom_magic"
+        });
+        let err = parse_task_boundary_from_dataset_task(&task).expect_err("should fail");
+        assert!(
+            err.to_string().contains("unsupported key"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_task_boundary_from_trial_input_legacy_without_task_defaults_empty() {
+        let input = json!({
+            "schema_version": "trial_input_v1",
+            "ids": { "trial_id": "trial_1" },
+            "runtime": {
+                "paths": {
+                    "workspace": "/tmp/workspace"
+                }
+            }
+        });
+
+        let parsed = parse_task_boundary_from_trial_input(&input).expect("parse legacy input");
+        assert_eq!(
+            parsed
+                .task_payload
+                .as_object()
+                .map(|obj| obj.len())
+                .unwrap_or_default(),
+            0
+        );
+        assert!(parsed.workspace_files.is_empty());
+        assert!(parsed.mount_references.is_empty());
+        assert!(parsed.limits.is_empty());
+    }
+
+    #[test]
+    fn materialize_workspace_files_writes_utf8_and_base64() {
+        let root = TempDirGuard::new("agentlab_task_boundary_workspace_files");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        fs::write(exp_dir.join("README.md"), "fixture").expect("exp fixture");
+        let dataset_src = root.path.join("tasks.jsonl");
+        fs::write(&dataset_src, "{\"id\":\"task_1\"}\n").expect("dataset");
+        let trial_dir = root.path.join("trial_1");
+        ensure_dir(&trial_dir).expect("trial");
+        let paths = TrialPaths::new(&trial_dir, &exp_dir, &dataset_src).expect("trial paths");
+        paths.prepare().expect("prepare");
+
+        let files = vec![
+            WorkspaceFileSpec {
+                path: "notes/plain.txt".to_string(),
+                content: "hello world".to_string(),
+                encoding: Some("utf8".to_string()),
+                executable: false,
+            },
+            WorkspaceFileSpec {
+                path: "notes/decoded.txt".to_string(),
+                content: "aGVsbG8gYmFzZTY0".to_string(),
+                encoding: Some("base64".to_string()),
+                executable: false,
+            },
+        ];
+
+        materialize_workspace_files(&paths, &files).expect("materialize");
+        assert_eq!(
+            fs::read_to_string(paths.workspace.join("notes/plain.txt")).expect("plain"),
+            "hello world"
+        );
+        assert_eq!(
+            fs::read_to_string(paths.workspace.join("notes/decoded.txt")).expect("decoded"),
+            "hello base64"
+        );
+    }
+
+    #[test]
+    fn resolve_task_mounts_requires_container_and_existing_pack() {
+        let root = TempDirGuard::new("agentlab_task_boundary_mounts");
+        let digest = "b".repeat(64);
+        let pack_dir = root.path.join(".lab").join("dataset_packs").join("sha256");
+        ensure_dir(&pack_dir).expect("pack dir");
+        fs::write(pack_dir.join(&digest), "pack bytes").expect("pack file");
+
+        let refs = vec![MountReferenceSpec {
+            dataset_pack_ref: format!("sha256:{}", digest),
+            mount_path: "/workspace/dataset_pack".to_string(),
+            read_only: true,
+        }];
+        let resolved = resolve_task_mounts(&root.path, &refs, true).expect("resolve mounts");
+        assert_eq!(resolved.len(), 1);
+        assert!(
+            resolved[0].host_path.ends_with(Path::new(&digest)),
+            "unexpected host path: {}",
+            resolved[0].host_path.display()
+        );
+
+        let err =
+            resolve_task_mounts(&root.path, &refs, false).expect_err("local mode should fail");
+        assert!(
+            err.to_string().contains("require container"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn build_trial_input_uses_run_id_and_limits() {
+        let root = TempDirGuard::new("agentlab_task_boundary_trial_input");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp");
+        fs::write(exp_dir.join("harness.sh"), "#!/bin/sh\n").expect("harness");
+        let dataset_src = root.path.join("tasks.jsonl");
+        fs::write(&dataset_src, "{\"id\":\"task_1\"}\n").expect("dataset");
+        let trial_dir = root.path.join("trial_1");
+        ensure_dir(&trial_dir).expect("trial");
+        let paths = TrialPaths::new(&trial_dir, &exp_dir, &dataset_src).expect("paths");
+        paths.prepare().expect("prepare");
+
+        let json_value = json!({
+            "design": { "sanitization_profile": "hermetic_functional_v2" },
+            "runtime": {
+                "harness": {
+                    "integration_level": "cli_events",
+                    "control_plane": { "mode": "file", "path": "/state/lab_control.json" }
+                },
+                "network": { "mode": "none", "allowed_hosts": [] }
+            }
+        });
+        let variant = Variant {
+            id: "baseline".to_string(),
+            bindings: json!({ "model": "demo" }),
+        };
+        let task_boundary = TaskBoundaryMaterialization {
+            task_payload: json!({ "id": "task_1", "prompt": "x" }),
+            workspace_files: vec![WorkspaceFileSpec {
+                path: "input.txt".to_string(),
+                content: "hello".to_string(),
+                encoding: Some("utf8".to_string()),
+                executable: false,
+            }],
+            mount_references: vec![MountReferenceSpec {
+                dataset_pack_ref: format!("sha256:{}", "c".repeat(64)),
+                mount_path: "/workspace/dataset_pack".to_string(),
+                read_only: true,
+            }],
+            limits: TaskBoundaryLimits {
+                max_steps: Some(12),
+                max_total_tokens: Some(4096),
+                max_tool_calls: Some(9),
+                trial_seconds: Some(90),
+            },
+        };
+
+        let input = build_trial_input(
+            &json_value,
+            "run_actual_1",
+            "agent_harness",
+            "trial_1",
+            &variant,
+            0,
+            0,
+            &task_boundary,
+            &paths,
+            true,
+        );
+
+        assert_eq!(
+            input
+                .pointer("/ids/run_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "run_actual_1"
+        );
+        assert_eq!(
+            input
+                .pointer("/runtime/budgets/max_steps")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            12
+        );
+        assert_eq!(
+            input
+                .pointer("/runtime/timeouts/trial_seconds")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            90
+        );
+        assert_eq!(
+            input
+                .pointer("/ext/task_boundary_v1/workspace_files/0/path")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "input.txt"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_trial_schedule tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn schedule_variant_sequential_orders_variant_then_task_then_repl() {
+        let slots = build_trial_schedule(2, 3, 2, SchedulingPolicy::VariantSequential, 1);
+        assert_eq!(slots.len(), 12); // 2 variants * 3 tasks * 2 repls
+
+        // First 6 slots should be variant 0
+        for slot in &slots[0..6] {
+            assert_eq!(slot.variant_idx, 0);
+        }
+        // Last 6 slots should be variant 1
+        for slot in &slots[6..12] {
+            assert_eq!(slot.variant_idx, 1);
+        }
+
+        // Within variant 0: task 0 repl 0, task 0 repl 1, task 1 repl 0, ...
+        assert_eq!(slots[0].task_idx, 0);
+        assert_eq!(slots[0].repl_idx, 0);
+        assert_eq!(slots[1].task_idx, 0);
+        assert_eq!(slots[1].repl_idx, 1);
+        assert_eq!(slots[2].task_idx, 1);
+        assert_eq!(slots[2].repl_idx, 0);
+    }
+
+    #[test]
+    fn schedule_paired_interleaved_orders_task_then_variant_then_repl() {
+        let slots = build_trial_schedule(2, 3, 2, SchedulingPolicy::PairedInterleaved, 1);
+        assert_eq!(slots.len(), 12);
+
+        // First 4 slots should all be task 0 (2 variants * 2 repls)
+        for slot in &slots[0..4] {
+            assert_eq!(slot.task_idx, 0);
+        }
+        // Within task 0: variant 0 repl 0, variant 0 repl 1, variant 1 repl 0, variant 1 repl 1
+        assert_eq!(slots[0].variant_idx, 0);
+        assert_eq!(slots[0].repl_idx, 0);
+        assert_eq!(slots[1].variant_idx, 0);
+        assert_eq!(slots[1].repl_idx, 1);
+        assert_eq!(slots[2].variant_idx, 1);
+        assert_eq!(slots[2].repl_idx, 0);
+        assert_eq!(slots[3].variant_idx, 1);
+        assert_eq!(slots[3].repl_idx, 1);
+    }
+
+    #[test]
+    fn schedule_paired_interleaved_pairs_variants_on_same_task() {
+        // Key A/B test property: for each task, all variants run before moving to next task
+        let slots = build_trial_schedule(3, 4, 1, SchedulingPolicy::PairedInterleaved, 1);
+        assert_eq!(slots.len(), 12); // 3 variants * 4 tasks * 1 repl
+
+        for task_idx in 0..4 {
+            let task_slots: Vec<_> = slots.iter().filter(|s| s.task_idx == task_idx).collect();
+            assert_eq!(task_slots.len(), 3); // one per variant
+            let variant_ids: Vec<_> = task_slots.iter().map(|s| s.variant_idx).collect();
+            assert_eq!(variant_ids, vec![0, 1, 2]);
+        }
+    }
+
+    #[test]
+    fn schedule_randomized_contains_all_slots() {
+        let slots = build_trial_schedule(2, 3, 2, SchedulingPolicy::Randomized, 42);
+        assert_eq!(slots.len(), 12);
+
+        // Every (variant, task, repl) triple should appear exactly once
+        let mut seen = HashSet::new();
+        for slot in &slots {
+            let key = (slot.variant_idx, slot.task_idx, slot.repl_idx);
+            assert!(seen.insert(key), "duplicate slot: {:?}", key);
+        }
+        assert_eq!(seen.len(), 12);
+    }
+
+    #[test]
+    fn schedule_randomized_is_deterministic_with_same_seed() {
+        let a = build_trial_schedule(2, 4, 2, SchedulingPolicy::Randomized, 1337);
+        let b = build_trial_schedule(2, 4, 2, SchedulingPolicy::Randomized, 1337);
+        for (sa, sb) in a.iter().zip(b.iter()) {
+            assert_eq!(sa.variant_idx, sb.variant_idx);
+            assert_eq!(sa.task_idx, sb.task_idx);
+            assert_eq!(sa.repl_idx, sb.repl_idx);
+        }
+    }
+
+    #[test]
+    fn schedule_randomized_different_seed_produces_different_order() {
+        let a = build_trial_schedule(2, 4, 2, SchedulingPolicy::Randomized, 1);
+        let b = build_trial_schedule(2, 4, 2, SchedulingPolicy::Randomized, 2);
+        // With 16 slots, the probability of identical ordering is negligible
+        let same = a.iter().zip(b.iter()).all(|(sa, sb)| {
+            sa.variant_idx == sb.variant_idx
+                && sa.task_idx == sb.task_idx
+                && sa.repl_idx == sb.repl_idx
+        });
+        assert!(!same, "different seeds should produce different orderings");
+    }
+
+    #[test]
+    fn schedule_single_variant_single_task_single_repl() {
+        for policy in [
+            SchedulingPolicy::VariantSequential,
+            SchedulingPolicy::PairedInterleaved,
+            SchedulingPolicy::Randomized,
+        ] {
+            let slots = build_trial_schedule(1, 1, 1, policy, 1);
+            assert_eq!(slots.len(), 1);
+            assert_eq!(slots[0].variant_idx, 0);
+            assert_eq!(slots[0].task_idx, 0);
+            assert_eq!(slots[0].repl_idx, 0);
+        }
+    }
+
+    #[test]
+    fn schedule_empty_when_zero_tasks() {
+        let slots = build_trial_schedule(2, 0, 3, SchedulingPolicy::VariantSequential, 1);
+        assert!(slots.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // should_retry_outcome tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn retry_with_empty_retry_on_retries_any_failure() {
+        // Empty retry_on means retry on any non-success
+        assert!(should_retry_outcome("error", "0", &[]));
+        assert!(should_retry_outcome("success", "1", &[])); // exit nonzero
+        assert!(!should_retry_outcome("success", "0", &[])); // success — no retry
+    }
+
+    #[test]
+    fn retry_on_error_only_retries_error_outcome() {
+        let triggers = vec!["error".to_string()];
+        assert!(should_retry_outcome("error", "0", &triggers));
+        assert!(should_retry_outcome("error", "1", &triggers));
+        assert!(!should_retry_outcome("success", "0", &triggers));
+        assert!(!should_retry_outcome("success", "1", &triggers)); // exit nonzero but not "error"
+    }
+
+    #[test]
+    fn retry_on_failure_retries_nonzero_exit() {
+        let triggers = vec!["failure".to_string()];
+        assert!(should_retry_outcome("success", "1", &triggers));
+        assert!(should_retry_outcome("error", "137", &triggers));
+        assert!(!should_retry_outcome("success", "0", &triggers));
+        assert!(!should_retry_outcome("error", "0", &triggers)); // error outcome but exit 0
+    }
+
+    #[test]
+    fn retry_on_timeout_retries_timeout_outcome() {
+        let triggers = vec!["timeout".to_string()];
+        assert!(should_retry_outcome("timeout", "0", &triggers));
+        assert!(should_retry_outcome("timeout", "1", &triggers));
+        assert!(!should_retry_outcome("error", "0", &triggers));
+        assert!(!should_retry_outcome("success", "0", &triggers));
+    }
+
+    #[test]
+    fn retry_on_multiple_triggers() {
+        let triggers = vec!["error".to_string(), "timeout".to_string()];
+        assert!(should_retry_outcome("error", "0", &triggers));
+        assert!(should_retry_outcome("timeout", "0", &triggers));
+        assert!(!should_retry_outcome("success", "1", &triggers)); // failure not in triggers
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_policies tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_policies_defaults_when_no_policies_section() {
+        let spec = json!({
+            "design": {
+                "replications": 1,
+                "random_seed": 1
+            }
+        });
+        let config = parse_policies(&spec);
+        assert_eq!(config.scheduling, SchedulingPolicy::VariantSequential);
+        assert_eq!(config.state, StatePolicy::IsolatePerTrial);
+        assert_eq!(config.retry_max_attempts, 1);
+        assert!(config.retry_on.is_empty());
+        assert!(config.pruning_max_consecutive_failures.is_none());
+    }
+
+    #[test]
+    fn parse_policies_reads_all_fields() {
+        let spec = json!({
+            "design": {
+                "policies": {
+                    "scheduling": "paired_interleaved",
+                    "state": "persist_per_task",
+                    "retry": {
+                        "max_attempts": 3,
+                        "retry_on": ["error", "timeout"]
+                    },
+                    "pruning": {
+                        "max_consecutive_failures": 5
+                    }
+                }
+            }
+        });
+        let config = parse_policies(&spec);
+        assert_eq!(config.scheduling, SchedulingPolicy::PairedInterleaved);
+        assert_eq!(config.state, StatePolicy::PersistPerTask);
+        assert_eq!(config.retry_max_attempts, 3);
+        assert_eq!(config.retry_on, vec!["error", "timeout"]);
+        assert_eq!(config.pruning_max_consecutive_failures, Some(5));
+    }
+
+    #[test]
+    fn parse_policies_handles_randomized_scheduling() {
+        let spec = json!({
+            "design": {
+                "policies": {
+                    "scheduling": "randomized",
+                    "state": "accumulate",
+                    "retry": { "max_attempts": 1 }
+                }
+            }
+        });
+        let config = parse_policies(&spec);
+        assert_eq!(config.scheduling, SchedulingPolicy::Randomized);
+        assert_eq!(config.state, StatePolicy::Accumulate);
+    }
+
+    #[test]
+    fn parse_policies_unknown_scheduling_defaults_to_variant_sequential() {
+        let spec = json!({
+            "design": {
+                "policies": {
+                    "scheduling": "unknown_value",
+                    "state": "unknown_state",
+                    "retry": { "max_attempts": 1 }
+                }
+            }
+        });
+        let config = parse_policies(&spec);
+        assert_eq!(config.scheduling, SchedulingPolicy::VariantSequential);
+        assert_eq!(config.state, StatePolicy::IsolatePerTrial);
+    }
+
+    #[test]
+    fn parse_policies_missing_retry_defaults_to_one_attempt() {
+        let spec = json!({
+            "design": {
+                "policies": {
+                    "scheduling": "variant_sequential",
+                    "state": "isolate_per_trial"
+                }
+            }
+        });
+        let config = parse_policies(&spec);
+        assert_eq!(config.retry_max_attempts, 1);
+        assert!(config.retry_on.is_empty());
     }
 }

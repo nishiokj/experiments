@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/task_chain_state_v1.json",
+  "title": "Task Chain State v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "chain_id", "task_model", "step_index", "ids", "snapshots", "diffs"],
+  "properties": {
+    "schema_version": { "const": "task_chain_state_v1" },
+    "ts": { "type": "string", "format": "date-time" },
+    "run_id": { "type": "string", "minLength": 1 },
+    "chain_id": { "type": "string", "minLength": 1 },
+    "task_model": { "type": "string", "enum": ["independent", "dependent"] },
+    "step_index": { "type": "integer", "minimum": 0 },
+    "ids": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trial_id", "variant_id", "task_id", "repl_idx"],
+      "properties": {
+        "trial_id": { "type": "string", "minLength": 1 },
+        "variant_id": { "type": "string", "minLength": 1 },
+        "task_id": { "type": "string", "minLength": 1 },
+        "repl_idx": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "snapshots": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["chain_root_ref", "prev_ref", "post_ref"],
+      "properties": {
+        "chain_root_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
+        "prev_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
+        "post_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" }
+      }
+    },
+    "diffs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["incremental_ref", "cumulative_ref", "patch_incremental_ref", "patch_cumulative_ref"],
+      "properties": {
+        "incremental_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
+        "cumulative_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
+        "patch_incremental_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
+        "patch_cumulative_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" }
+      }
+    },
+    "ext": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+}

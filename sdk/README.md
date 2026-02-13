@@ -79,6 +79,156 @@ const run = await client.run({ experiment: '.lab/experiment.yaml' });
 console.log(`Done: ${run.run.run_id}`);
 ```
 
+## Boundary Mappers (Input + Outcome)
+
+Use boundary mappers when you want strict, typed control over what crosses the runner boundary.
+
+### InputMapper (implemented by you)
+
+All benchmark inputs must compile into exactly:
+
+- `task`
+- `workspace_files`
+- `mount_references`
+- `limits`
+
+This boundary is `TaskBoundaryV1` (`schema_version: "task_boundary_v1"`). If your input cannot be represented this way, you need a new runner capability (for example: GPU, network policy, privileged syscall), not a new task boundary type.
+
+```ts
+import {
+  compileTaskBoundaries,
+  taskBoundariesToJsonl,
+  type InputMapper,
+} from '@agentlab/sdk';
+
+type RawRow = {
+  id: string;
+  prompt: string;
+  fixturePackSha256: string;
+};
+
+const mapper: InputMapper<RawRow> = {
+  map(row, { index }) {
+    return {
+      schema_version: 'task_boundary_v1',
+      task: { id: row.id, prompt: row.prompt, index },
+      workspace_files: [
+        { path: 'README.md', content: `task ${row.id}` },
+      ],
+      mount_references: [
+        {
+          dataset_pack_ref: `sha256:${row.fixturePackSha256}`,
+          mount_path: '/workspace/dataset',
+          read_only: true,
+        },
+      ],
+      limits: { max_steps: 32, trial_seconds: 300 },
+    };
+  },
+};
+
+const compiled = compileTaskBoundaries(rawRows, mapper);
+const jsonl = taskBoundariesToJsonl(compiled);
+```
+
+### Runtime materialization model (implemented by the Runner)
+
+`workspace_files` and `mount_references` are **not** baked into your harness image at container build time.
+
+The harness image should stay generic (runtime + your harness code/deps). Task-specific materialization happens per trial:
+
+1. The runner creates trial directories (`workspace/`, `state/`, `dataset/`, `out/`, `tmp/`).
+2. The runner writes `workspace_files` into the trial `workspace/` (supports `utf8` and `base64` content).
+3. The runner resolves each `mount_references[*].dataset_pack_ref` from `.lab/dataset_packs/sha256/<digest>`.
+4. In container mode, those resolved dataset packs are bind-mounted read-only to `mount_path` under `/workspace/...`.
+5. In local-process mode, `mount_references` are rejected (mount refs require container execution).
+6. The runner builds `trial_input_v1` with:
+   - `/task` from the boundary `task`.
+   - `/runtime/budgets` from `limits.max_steps|max_total_tokens|max_tool_calls` when present.
+   - `/runtime/timeouts/trial_seconds` from `limits.trial_seconds` when present.
+7. The runner invokes exactly one harness command with env contracts (`AGENTLAB_TRIAL_INPUT`, `AGENTLAB_TRIAL_OUTPUT`, `AGENTLAB_CONTROL_PATH`, `AGENTLAB_HARNESS_ROOT`).
+8. The runner persists trial artifacts plus run-scope boundaries:
+   - `.lab/runs/<run_id>/trials/<trial_id>/...` (trial input/output, logs, snapshots, diffs, trial metadata)
+   - `.lab/runs/<run_id>/evidence/evidence_records.jsonl` (`evidence_record_v1`)
+   - `.lab/runs/<run_id>/evidence/task_chain_states.jsonl` (`task_chain_state_v1`)
+   - `.lab/runs/<run_id>/benchmark/{adapter_manifest,predictions,scores,summary}` (adapter/evaluator outputs)
+
+### OutcomeMapper (implemented by you)
+
+`OutcomeMapper` is user-implemented mapping from runner-emitted boundary to your domain outcome.
+
+`OutcomeBoundaryV1` includes:
+
+- `run_events` (typed `HookEvent[]`, JSONL event stream boundary)
+- `result_summary` (typed summary extracted from `trial_output_v1`)
+
+```ts
+import {
+  createOutcomeBoundary,
+  mapOutcome,
+  type OutcomeMapper,
+  type TrialOutput,
+  type HookEvent,
+} from '@agentlab/sdk';
+
+const mapper: OutcomeMapper<{ pass: boolean; tokenIn: number }> = {
+  map(boundary) {
+    const tokenIn = boundary.run_events
+      .filter((e) => e.event_type === 'model_call_end')
+      .reduce((acc, e) => acc + (e.usage?.tokens_in ?? 0), 0);
+    return {
+      pass: boundary.result_summary.outcome === 'success',
+      tokenIn,
+    };
+  },
+};
+
+const boundary = createOutcomeBoundary(trialOutput as TrialOutput, runEvents as HookEvent[]);
+const result = await mapOutcome(boundary, mapper);
+```
+
+### What your SDK script receives from `run()`
+
+`client.run(...)` returns run metadata plus artifact paths, not pre-mapped domain outcomes.
+
+Your script is responsible for loading trial artifacts and applying your `OutcomeMapper`:
+
+```ts
+import { readFileSync } from 'node:fs';
+import { createOutcomeBoundary, mapOutcome, type HookEvent, type TrialOutput } from '@agentlab/sdk';
+
+const run = await client.run({ experiment: '.lab/experiment.yaml' });
+const trialDir = `${run.run.run_dir}/trials/trial_1`;
+console.log(run.artifacts?.evidence_records_path);
+console.log(run.artifacts?.benchmark_summary_path);
+
+const trialOutput = JSON.parse(
+  readFileSync(`${trialDir}/trial_output.json`, 'utf8'),
+) as TrialOutput;
+
+const runEvents = readFileSync(`${trialDir}/state/harness_events.jsonl`, 'utf8')
+  .trim()
+  .split('\n')
+  .filter(Boolean)
+  .map((line) => JSON.parse(line) as HookEvent);
+
+const boundary = createOutcomeBoundary(trialOutput, runEvents);
+const mapped = await mapOutcome(boundary, mapper);
+
+// Optional: read typed run-scope boundaries
+const evidence = await client.readEvidence({ runDir: run.run.run_dir });
+const benchmark = await client.readBenchmark({ runDir: run.run.run_dir });
+```
+
+### Standardized runtime contracts (v1)
+
+The SDK exports versioned, fixed contracts for interoperability across entrypoints and harness variants:
+
+- `WORKSPACE_CONTRACT_V1` (`/workspace`, manifest path, artifacts dir)
+- `INVOCATION_ENV_CONTRACT_V1` (env vars + one-command invocation model)
+- `EVENT_OUTPUT_CONTRACT_V1` (run events JSONL + result summary path)
+- `createRunnerBoundaryManifest(command)` (versioned manifest object)
+
 ## ExperimentBuilder
 
 Fluent API for building `ExperimentSpec` objects. All required fields must be explicitly set — `build()` validates completeness and throws listing any missing fields.
@@ -112,6 +262,7 @@ These must be called before `build()` or `toYaml()`:
 | `.metric(def)` | Add a metric definition. See Metrics below. | |
 | `.guardrail(def)` | Add a budget guardrail. See Guardrails below. | |
 | `.artifacts(opts)` | Configure workspace artifact collection. See Artifacts below. | |
+| `.benchmark(config)` | Configure benchmark policy + adapter command/manifest (optional). | |
 | `.networkMode(mode, hosts?)` | `'none'`, `'full'`, or `'allowlist_enforced'` with allowed hosts. | `'none'` |
 | `.sandboxImage(image)` | Docker image name. Sets sandbox mode to `container`. | |
 | `.localSandbox()` | Run without container isolation. | `local` |
@@ -275,6 +426,8 @@ Resolves the binary in order:
 | `validateHooks(args)` | `ValidateResponse` | Validate event stream against harness manifest |
 | `validateSchema(args)` | `ValidateResponse` | Validate JSON file against schema |
 | `readAnalysis(args)` | `ReadAnalysisResponse` | Read analysis summary and comparisons from a run directory |
+| `readEvidence(args)` | `ReadEvidenceResponse` | Read `evidence_record_v1` + `task_chain_state_v1` JSONL |
+| `readBenchmark(args)` | `ReadBenchmarkResponse` | Read benchmark adapter manifest/predictions/scores/summary |
 
 All commands accept per-call `cwd` and `env` overrides.
 
@@ -369,7 +522,7 @@ const output: TrialOutput = {
   outcome: 'success',
   answer: 'The fix is ...',
   metrics: { accuracy: 0.95, cost_usd: 0.12 },
-  objective: [{ name: 'resolved', value: 1.0, direction: 'maximize' }],
+  objective: { name: 'resolved', value: 1.0, direction: 'maximize' },
   artifacts: [{ path: '/out/patch.diff', logical_name: 'solution_diff' }],
   checkpoints: [{ path: '/state/cp1.json', logical_name: 'after_analysis', step: 3 }],
 };
@@ -437,6 +590,7 @@ export type {
   ExperimentSpec, MetricDef, MetricSource, MetricAggregate,
   ArtifactMeasure, GuardrailDef, Bindings,
   DatasetJsonlOptions, HarnessCliOptions,
+  BenchmarkTypePolicy, BenchmarkAdapterConfig, BenchmarkConfig,
 } from '@agentlab/sdk';
 
 // Client types
@@ -452,8 +606,13 @@ export type {
   KnobsValidateArgs, HooksValidateArgs, SchemaValidateArgs,
   ValidateResponse,
   ReadAnalysisArgs, ReadAnalysisResponse,
+  ReadEvidenceArgs, ReadEvidenceResponse,
+  ReadBenchmarkArgs, ReadBenchmarkResponse,
+  RunArtifacts,
   AnalysisSummary, AnalysisComparisons, ComparisonEntry,
   VariantSummary, EventCounts,
+  EvidenceRecord, TaskChainStateRecord,
+  BenchmarkAdapterManifest, BenchmarkPredictionRecord, BenchmarkScoreRecord, BenchmarkSummary,
 } from '@agentlab/sdk';
 
 // Trial output types

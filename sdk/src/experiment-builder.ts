@@ -205,6 +205,104 @@ export class Metric {
 }
 
 // ---------------------------------------------------------------------------
+// Design Policies
+// ---------------------------------------------------------------------------
+
+export type SchedulingPolicy = 'paired_interleaved' | 'variant_sequential' | 'randomized';
+export type StatePolicy = 'isolate_per_trial' | 'persist_per_task' | 'accumulate';
+export type ComparisonPolicy = 'paired' | 'unpaired' | 'none';
+
+export type RetryTrigger = 'error' | 'timeout' | 'failure';
+
+export interface RetryPolicy {
+  max_attempts: number;
+  retry_on?: readonly RetryTrigger[];
+}
+
+export interface PruningPolicy {
+  max_consecutive_failures?: number;
+}
+
+export interface DesignPolicies {
+  scheduling: SchedulingPolicy;
+  state: StatePolicy;
+  comparison: ComparisonPolicy;
+  retry: RetryPolicy;
+  pruning?: PruningPolicy;
+}
+
+export type BenchmarkTaskModel = 'independent' | 'dependent';
+export type BenchmarkScoringLifecycle = 'predict_then_score' | 'integrated_score';
+
+export interface BenchmarkTypePolicy {
+  task_model?: BenchmarkTaskModel;
+  reset_strategy?: 'per_trial' | 'per_chain' | 'never';
+  evaluator_mode?: 'official' | 'custom';
+  scoring_lifecycle?: BenchmarkScoringLifecycle;
+  required_evidence_classes?: string[];
+  chain_failure_policy?: 'stop_on_error' | 'continue_with_flag';
+}
+
+export interface BenchmarkAdapterConfig {
+  command: string[];
+  manifest?: Record<string, unknown>;
+}
+
+export interface BenchmarkConfig {
+  policy?: BenchmarkTypePolicy;
+  adapter?: BenchmarkAdapterConfig;
+}
+
+function copyPolicies(p: DesignPolicies): DesignPolicies {
+  return {
+    scheduling: p.scheduling,
+    state: p.state,
+    comparison: p.comparison,
+    retry: {
+      max_attempts: p.retry.max_attempts,
+      retry_on: p.retry.retry_on ? [...p.retry.retry_on] : undefined,
+    },
+    pruning: p.pruning ? { ...p.pruning } : undefined,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Experiment Type Presets
+// ---------------------------------------------------------------------------
+
+const DEFAULT_RETRY: RetryPolicy = { max_attempts: 1 };
+
+export const ExperimentType = {
+  AB_TEST: {
+    scheduling: 'paired_interleaved',
+    state: 'isolate_per_trial',
+    comparison: 'paired',
+    retry: { ...DEFAULT_RETRY },
+  } satisfies DesignPolicies,
+
+  MULTI_VARIANT: {
+    scheduling: 'paired_interleaved',
+    state: 'isolate_per_trial',
+    comparison: 'paired',
+    retry: { ...DEFAULT_RETRY },
+  } satisfies DesignPolicies,
+
+  PARAMETER_SWEEP: {
+    scheduling: 'variant_sequential',
+    state: 'isolate_per_trial',
+    comparison: 'unpaired',
+    retry: { ...DEFAULT_RETRY },
+  } satisfies DesignPolicies,
+
+  REGRESSION: {
+    scheduling: 'variant_sequential',
+    state: 'isolate_per_trial',
+    comparison: 'none',
+    retry: { max_attempts: 3, retry_on: ['error'] },
+  } satisfies DesignPolicies,
+} as const;
+
+// ---------------------------------------------------------------------------
 // ExperimentSpec
 // ---------------------------------------------------------------------------
 
@@ -227,11 +325,12 @@ export interface ExperimentSpec {
   };
   design: {
     sanitization_profile: string;
-    comparison: 'paired' | 'unpaired';
+    comparison: ComparisonPolicy;
     replications: number;
     random_seed: number;
     shuffle_tasks: boolean;
     max_concurrency: number;
+    policies?: DesignPolicies;
   };
   metrics: MetricDef[];
   guardrails?: GuardrailDef[];
@@ -251,6 +350,10 @@ export interface ExperimentSpec {
     variant_id: string;
     bindings: Bindings;
   }>;
+  benchmark?: {
+    policy?: BenchmarkTypePolicy;
+    adapter?: BenchmarkAdapterConfig;
+  };
   runtime: {
     harness: {
       mode: 'cli';
@@ -296,8 +399,17 @@ export interface ExperimentSpec {
 export class ExperimentBuilder {
   private readonly spec: ExperimentSpec;
 
+  /** Create a builder with explicit id/name (defaults to variant_sequential). */
   static create(id: string, name: string): ExperimentBuilder {
     return new ExperimentBuilder(id, name);
+  }
+
+  /** Create a builder from a policy bundle (preset or custom). Set id/name via .id()/.name(). */
+  static from(policies: DesignPolicies): ExperimentBuilder {
+    const builder = new ExperimentBuilder('', '');
+    builder.spec.design.policies = copyPolicies(policies);
+    builder.spec.design.comparison = policies.comparison;
+    return builder;
   }
 
   private constructor(id: string, name: string) {
@@ -355,6 +467,16 @@ export class ExperimentBuilder {
     };
   }
 
+  id(value: string): this {
+    this.spec.experiment.id = value;
+    return this;
+  }
+
+  name(value: string): this {
+    this.spec.experiment.name = value;
+    return this;
+  }
+
   description(value: string): this {
     this.spec.experiment.description = value;
     return this;
@@ -398,6 +520,28 @@ export class ExperimentBuilder {
     return this;
   }
 
+  benchmark(config: BenchmarkConfig): this {
+    this.spec.benchmark = {
+      policy: config.policy
+        ? {
+            ...config.policy,
+            required_evidence_classes: config.policy.required_evidence_classes
+              ? [...config.policy.required_evidence_classes]
+              : undefined,
+          }
+        : undefined,
+      adapter: config.adapter
+        ? {
+            command: [...config.adapter.command],
+            manifest: config.adapter.manifest
+              ? JSON.parse(JSON.stringify(config.adapter.manifest)) as Record<string, unknown>
+              : undefined,
+          }
+        : undefined,
+    };
+    return this;
+  }
+
   replications(value: number): this {
     this.spec.design.replications = value;
     return this;
@@ -415,6 +559,13 @@ export class ExperimentBuilder {
 
   maxConcurrency(value: number): this {
     this.spec.design.max_concurrency = value;
+    return this;
+  }
+
+  /** Set design policies directly (overrides any preset from .from()). */
+  policies(value: DesignPolicies): this {
+    this.spec.design.policies = copyPolicies(value);
+    this.spec.design.comparison = value.comparison;
     return this;
   }
 
@@ -473,6 +624,8 @@ export class ExperimentBuilder {
 
   build(): ExperimentSpec {
     const missing: string[] = [];
+    if (!this.spec.experiment.id) missing.push('experiment id (call .id() or use ExperimentBuilder.create())');
+    if (!this.spec.experiment.name) missing.push('experiment name (call .name() or use ExperimentBuilder.create())');
     if (!this.spec.dataset.path) missing.push('dataset path (call .datasetJsonl())');
     if (!this.spec.dataset.suite_id) missing.push('dataset suite_id (call .datasetJsonl() with suiteId)');
     if (!this.spec.dataset.split_id) missing.push('dataset split_id (call .datasetJsonl() with splitId)');
@@ -484,6 +637,30 @@ export class ExperimentBuilder {
         `ExperimentBuilder: required fields not set:\n${missing.map((m) => `  - ${m}`).join('\n')}`,
       );
     }
+
+    // Policy coherence validation
+    const policies = this.spec.design.policies;
+    if (policies) {
+      const errors: string[] = [];
+      const treatmentCount = this.spec.variant_plan.length;
+      const totalVariants = treatmentCount + 1; // baseline + treatments
+
+      if (policies.comparison === 'paired' && totalVariants < 2) {
+        errors.push('paired comparison requires at least one treatment variant (call .addVariant())');
+      }
+      if (policies.scheduling === 'paired_interleaved' && totalVariants < 2) {
+        errors.push('paired_interleaved scheduling requires at least 2 variants');
+      }
+      if (policies.retry.max_attempts < 1) {
+        errors.push('retry.max_attempts must be >= 1');
+      }
+      if (errors.length > 0) {
+        throw new Error(
+          `ExperimentBuilder: policy coherence errors:\n${errors.map((e) => `  - ${e}`).join('\n')}`,
+        );
+      }
+    }
+
     return JSON.parse(JSON.stringify(this.spec)) as ExperimentSpec;
   }
 

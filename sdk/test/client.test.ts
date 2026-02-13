@@ -956,3 +956,178 @@ describe('LabClient.readAnalysis()', () => {
     assert.equal(result.comparisons.comparisons.length, 1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// LabClient – readEvidence() / readBenchmark()
+// ---------------------------------------------------------------------------
+describe('LabClient.readEvidence() and readBenchmark()', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'sdk-test-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('readEvidence parses evidence and task-chain JSONL files', async () => {
+    const runDir = join(dir, 'run_001');
+    const evidenceDir = join(runDir, 'evidence');
+    mkdirSync(evidenceDir, { recursive: true });
+    writeFileSync(
+      join(evidenceDir, 'evidence_records.jsonl'),
+      `${JSON.stringify({
+        schema_version: 'evidence_record_v1',
+        ids: {
+          run_id: 'run_001',
+          trial_id: 'trial_1',
+          variant_id: 'control',
+          task_id: 'task_1',
+          repl_idx: 0,
+        },
+        runtime: {
+          executor: 'local_process',
+          container_mode: false,
+          exit_status: '0',
+        },
+        evidence: {
+          trial_input_ref: 'artifact://sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          trial_output_ref: 'artifact://sha256/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+          workspace_pre_ref: 'artifact://sha256/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+          workspace_post_ref: 'artifact://sha256/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+          diff_incremental_ref: 'artifact://sha256/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+          diff_cumulative_ref: 'artifact://sha256/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+          patch_incremental_ref: 'artifact://sha256/1111111111111111111111111111111111111111111111111111111111111111',
+          patch_cumulative_ref: 'artifact://sha256/2222222222222222222222222222222222222222222222222222222222222222',
+        },
+      })}\n`,
+    );
+    writeFileSync(
+      join(evidenceDir, 'task_chain_states.jsonl'),
+      `${JSON.stringify({
+        schema_version: 'task_chain_state_v1',
+        run_id: 'run_001',
+        chain_id: 'control::task_1',
+        task_model: 'independent',
+        step_index: 0,
+        ids: {
+          trial_id: 'trial_1',
+          variant_id: 'control',
+          task_id: 'task_1',
+          repl_idx: 0,
+        },
+        snapshots: {
+          chain_root_ref: 'artifact://sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          prev_ref: 'artifact://sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          post_ref: 'artifact://sha256/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        },
+        diffs: {
+          incremental_ref: 'artifact://sha256/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+          cumulative_ref: 'artifact://sha256/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+          patch_incremental_ref: 'artifact://sha256/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+          patch_cumulative_ref: 'artifact://sha256/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+        },
+      })}\n`,
+    );
+
+    const client = new LabClient({ cwd: dir });
+    const result = await client.readEvidence({ runDir: 'run_001' });
+
+    assert.equal(result.evidence.length, 1);
+    assert.equal(result.taskChains.length, 1);
+    assert.equal(result.evidence[0].schema_version, 'evidence_record_v1');
+    assert.equal(result.taskChains[0].schema_version, 'task_chain_state_v1');
+  });
+
+  test('readEvidence returns empty arrays when files are missing', async () => {
+    const runDir = join(dir, 'run_002', 'evidence');
+    mkdirSync(runDir, { recursive: true });
+    const client = new LabClient({ cwd: dir });
+    const result = await client.readEvidence({ runDir: 'run_002' });
+    assert.deepEqual(result.evidence, []);
+    assert.deepEqual(result.taskChains, []);
+  });
+
+  test('readBenchmark parses manifest, predictions, scores, and summary', async () => {
+    const runDir = join(dir, 'run_003');
+    const benchmarkDir = join(runDir, 'benchmark');
+    mkdirSync(benchmarkDir, { recursive: true });
+    writeFileSync(
+      join(benchmarkDir, 'adapter_manifest.json'),
+      JSON.stringify({
+        schema_version: 'benchmark_adapter_manifest_v1',
+        adapter_id: 'demo_adapter',
+        adapter_version: '1.0.0',
+        benchmark: { name: 'demo', split: 'dev' },
+        execution_mode: 'predict_then_score',
+        record_schemas: {
+          prediction: 'benchmark_prediction_record_v1',
+          score: 'benchmark_score_record_v1',
+        },
+        evaluator: { name: 'demo_eval', mode: 'custom' },
+      }),
+    );
+    writeFileSync(
+      join(benchmarkDir, 'predictions.jsonl'),
+      `${JSON.stringify({
+        schema_version: 'benchmark_prediction_record_v1',
+        ids: {
+          run_id: 'run_003',
+          trial_id: 'trial_1',
+          variant_id: 'control',
+          task_id: 'task_1',
+          repl_idx: 0,
+        },
+        benchmark: { adapter_id: 'demo_adapter', name: 'demo', split: 'dev' },
+        prediction: { kind: 'json', value: { answer: 'x' } },
+      })}\n`,
+    );
+    writeFileSync(
+      join(benchmarkDir, 'scores.jsonl'),
+      `${JSON.stringify({
+        schema_version: 'benchmark_score_record_v1',
+        ids: {
+          run_id: 'run_003',
+          trial_id: 'trial_1',
+          variant_id: 'control',
+          task_id: 'task_1',
+          repl_idx: 0,
+        },
+        benchmark: { adapter_id: 'demo_adapter', name: 'demo', split: 'dev' },
+        verdict: 'pass',
+        primary_metric_name: 'resolved',
+        primary_metric_value: 1,
+        evaluator: { name: 'demo_eval', mode: 'custom' },
+      })}\n`,
+    );
+    writeFileSync(
+      join(benchmarkDir, 'summary.json'),
+      JSON.stringify({
+        schema_version: 'benchmark_summary_v1',
+        run_id: 'run_003',
+        benchmark: { adapter_id: 'demo_adapter', name: 'demo', split: 'dev' },
+        totals: { trials: 1, pass: 1, fail: 0, missing: 0, error: 0 },
+        variants: [{ variant_id: 'control', total: 1, pass_rate: 1 }],
+      }),
+    );
+
+    const client = new LabClient({ cwd: dir });
+    const result = await client.readBenchmark({ runDir: 'run_003' });
+
+    assert.equal(result.manifest?.schema_version, 'benchmark_adapter_manifest_v1');
+    assert.equal(result.predictions.length, 1);
+    assert.equal(result.scores.length, 1);
+    assert.equal(result.summary?.schema_version, 'benchmark_summary_v1');
+  });
+
+  test('readBenchmark returns null/empty defaults when files are missing', async () => {
+    const runDir = join(dir, 'run_004', 'benchmark');
+    mkdirSync(runDir, { recursive: true });
+    const client = new LabClient({ cwd: dir });
+    const result = await client.readBenchmark({ runDir: 'run_004' });
+    assert.equal(result.manifest, null);
+    assert.equal(result.summary, null);
+    assert.deepEqual(result.predictions, []);
+    assert.deepEqual(result.scores, []);
+  });
+});

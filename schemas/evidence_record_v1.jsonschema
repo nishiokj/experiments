@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/evidence_record_v1.json",
+  "title": "Evidence Record v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "ids", "runtime", "evidence"],
+  "properties": {
+    "schema_version": { "const": "evidence_record_v1" },
+    "ts": { "type": "string", "format": "date-time" },
+    "ids": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "trial_id", "variant_id", "task_id", "repl_idx"],
+      "properties": {
+        "run_id": { "type": "string", "minLength": 1 },
+        "trial_id": { "type": "string", "minLength": 1 },
+        "variant_id": { "type": "string", "minLength": 1 },
+        "task_id": { "type": "string", "minLength": 1 },
+        "repl_idx": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "state_policy": {
+          "type": "string",
+          "enum": ["isolate_per_trial", "persist_per_task", "accumulate"]
+        },
+        "task_model": {
+          "type": "string",
+          "enum": ["independent", "dependent"]
+        },
+        "chain_id": { "type": "string", "minLength": 1 },
+        "chain_step_index": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["executor", "container_mode", "exit_status"],
+      "properties": {
+        "executor": {
+          "type": "string",
+          "enum": ["local_docker", "local_process", "remote"]
+        },
+        "container_mode": { "type": "boolean" },
+        "exit_status": { "type": "string" },
+        "duration_ms": { "type": "number", "minimum": 0 }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trial_input_ref", "trial_output_ref", "workspace_pre_ref", "workspace_post_ref", "diff_incremental_ref", "diff_cumulative_ref", "patch_incremental_ref", "patch_cumulative_ref"],
+      "properties": {
+        "trial_input_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
+        "trial_output_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
+        "stdout_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
+        "stderr_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
+        "hook_events_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
+        "harness_request_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
+        "harness_response_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
+        "workspace_pre_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
+        "workspace_post_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
+        "diff_incremental_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
+        "diff_cumulative_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
+        "patch_incremental_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
+        "patch_cumulative_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
+        "supplemental_refs": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" }
+        }
+      }
+    },
+    "paths": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "trial_dir": { "type": "string", "minLength": 1 },
+        "trial_input": { "type": "string", "minLength": 1 },
+        "trial_output": { "type": "string", "minLength": 1 },
+        "stdout": { "type": "string", "minLength": 1 },
+        "stderr": { "type": "string", "minLength": 1 },
+        "hook_events": { "type": "string", "minLength": 1 },
+        "workspace_pre_snapshot": { "type": "string", "minLength": 1 },
+        "workspace_post_snapshot": { "type": "string", "minLength": 1 },
+        "diff_incremental": { "type": "string", "minLength": 1 },
+        "diff_cumulative": { "type": "string", "minLength": 1 },
+        "patch_incremental": { "type": "string", "minLength": 1 },
+        "patch_cumulative": { "type": "string", "minLength": 1 }
+      }
+    },
+    "ext": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+}
